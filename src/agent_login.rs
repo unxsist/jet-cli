@@ -54,6 +54,7 @@ pub fn login_options(config: &Config, email: &str, fresh: bool, show_window: boo
         force_login: fresh || switching,
         show_window,
         start_visible: config.login_window_until.is_some_and(|t| t > now),
+        unattended: false,
     }
 }
 
@@ -249,7 +250,8 @@ struct DaemonState {
 /// stdout when the code was sent (or the login ended), then waits for `jet login code`.
 pub async fn daemon(ctx: Ctx, email: String, fresh: bool) -> Result<()> {
     let say = |v: serde_json::Value| println!("{v}");
-    let opts = login_options(&ctx.config, &email, fresh, false);
+    let mut opts = login_options(&ctx.config, &email, fresh, false);
+    opts.unattended = true;
     let mut session = LoginSession::start(
         ctx.api.http.clone(),
         ctx.paths.clone(),

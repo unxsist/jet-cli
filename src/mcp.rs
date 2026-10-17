@@ -299,7 +299,8 @@ impl Server {
                     return Ok(agent_login::link_reply(&url));
                 }
                 let email = agent_login::pick_email(&ctx.config, str_arg(args, "email"))?;
-                let opts = agent_login::login_options(&ctx.config, &email, false, false);
+                let mut opts = agent_login::login_options(&ctx.config, &email, false, false);
+                opts.unattended = true;
                 let mut session = LoginSession::start(
                     ctx.api.http.clone(),
                     ctx.paths.clone(),

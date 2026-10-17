@@ -52,6 +52,12 @@ fn emit(value: serde_json::Value) {
 }
 
 fn main() {
+    // `jet-webview --check`: proves the binary and its libraries load (a missing WebKitGTK fails
+    // in the dynamic loader, before main) without opening anything.
+    if std::env::args().any(|a| a == "--check") {
+        println!("ok");
+        return;
+    }
     let stdin = std::io::stdin();
     let mut first = String::new();
     if stdin.lock().read_line(&mut first).unwrap_or(0) == 0 {

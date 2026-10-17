@@ -56,6 +56,8 @@ pub enum Command {
     },
     /// Show the logged-in account.
     Whoami,
+    /// Check the setup: login, login window support, address, basket.
+    Doctor,
     /// Move a login to another machine (e.g. an agent's sandbox).
     Auth {
         #[command(subcommand)]

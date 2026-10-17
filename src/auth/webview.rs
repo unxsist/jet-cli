@@ -25,6 +25,9 @@ const PAGE_SCRIPT: &str = include_str!("webview.js");
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long the hidden window may wait for the security check before it's shown.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(4);
+/// Unattended logins: how long a shown window may wait for the security check before giving up.
+const UNATTENDED_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// How long to wait for the login page to react to a submitted code.
 const CODE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -34,6 +37,9 @@ pub struct LoginOptions {
     pub show_window: bool,
     /// Show the window right away (the security check needed it last time).
     pub start_visible: bool,
+    /// Nobody may be watching (agents): if the security check wants the window, give up after a
+    /// short while instead of waiting, so the caller can hand out a login link.
+    pub unattended: bool,
 }
 
 pub struct LoginOutcome {
@@ -57,14 +63,66 @@ impl std::error::Error for Unavailable {}
 /// Whether a login window can be shown here at all (a desktop session with the helper installed;
 /// not e.g. a headless server or cloud sandbox).
 pub fn can_show_window() -> bool {
-    if find_helper().is_none() {
-        return false;
+    matches!(helper_status(), HelperStatus::Ready(_))
+}
+
+/// Whether the login window can run here, and if not, why.
+#[derive(Debug, Clone)]
+pub enum HelperStatus {
+    Ready(PathBuf),
+    /// `jet-webview` isn't installed next to `jet` or on PATH.
+    Missing,
+    /// It doesn't start, usually missing libraries (WebKitGTK on Linux).
+    Broken {
+        path: PathBuf,
+        reason: String,
+    },
+    /// No desktop session to show a window in (server, sandbox).
+    NoDisplay(PathBuf),
+}
+
+pub fn helper_status() -> HelperStatus {
+    static STATUS: std::sync::OnceLock<HelperStatus> = std::sync::OnceLock::new();
+    STATUS.get_or_init(check_helper).clone()
+}
+
+fn check_helper() -> HelperStatus {
+    let Some(path) = find_helper() else {
+        return HelperStatus::Missing;
+    };
+    let out = std::process::Command::new(&path)
+        .arg("--check")
+        .stdin(Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            let reason = if err.contains("shared libraries") && cfg!(target_os = "linux") {
+                format!(
+                    "{err} (install WebKitGTK 4.1: libwebkit2gtk-4.1-0 on Debian/Ubuntu, webkit2gtk-4.1 on Arch/Fedora)"
+                )
+            } else if err.is_empty() {
+                format!("exited with {}", o.status)
+            } else {
+                err
+            };
+            return HelperStatus::Broken { path, reason };
+        }
+        Err(e) => {
+            return HelperStatus::Broken {
+                path,
+                reason: e.to_string(),
+            };
+        }
     }
-    if cfg!(target_os = "linux") {
-        return std::env::var_os("DISPLAY").is_some()
-            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    if cfg!(target_os = "linux")
+        && std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+    {
+        return HelperStatus::NoDisplay(path);
     }
-    true
+    HelperStatus::Ready(path)
 }
 
 /// `jet-webview` next to the running `jet` (release archives and `cargo install` put them
@@ -296,18 +354,25 @@ async fn drive(
     let note = |s: String| {
         let _ = events.send(LoginEvent::Note(s));
     };
-    let helper_path = find_helper().ok_or_else(|| Unavailable("jet-webview not found".into()))?;
+    let helper_path = match helper_status() {
+        HelperStatus::Ready(p) => p,
+        HelperStatus::Missing => {
+            return Err(Unavailable("jet-webview isn't installed next to jet".into()).into());
+        }
+        HelperStatus::Broken { reason, .. } => {
+            return Err(Unavailable(format!("jet-webview doesn't start: {reason}")).into());
+        }
+        HelperStatus::NoDisplay(_) => {
+            return Err(Unavailable("no screen to show a login window on".into()).into());
+        }
+    };
     let req = LoginRequest::new(tenant, opts.force_login);
     let debug = std::env::var_os("JET_DEBUG").is_some();
 
     let mut child = Command::new(&helper_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(if debug {
-            Stdio::inherit()
-        } else {
-            Stdio::null()
-        })
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| Unavailable(format!("{}: {e}", helper_path.display())))?;
@@ -315,6 +380,27 @@ async fn drive(
         stdin: child.stdin.take().context("helper stdin")?,
     };
     let stdout = child.stdout.take().context("helper stdout")?;
+    // Keep the end of the helper's error output to explain an early exit.
+    let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    if let Some(stderr) = child.stderr.take() {
+        let tail = stderr_tail.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if debug {
+                    eprintln!("[jet-webview] {line}");
+                }
+                let mut t = tail.lock().unwrap();
+                t.push_str(&line);
+                t.push('\n');
+                if t.len() > 2000 {
+                    let cut = t.len() - 2000;
+                    let cut = t.ceil_char_boundary(cut);
+                    t.drain(..cut);
+                }
+            }
+        });
+    }
 
     let mut visible = opts.show_window || opts.start_visible;
     let script = format!(
@@ -351,6 +437,7 @@ async fn drive(
     let ready_deadline = Instant::now() + Duration::from_secs(15);
     let mut check_deadline: Option<Instant> = None;
     let mut code_deadline: Option<Instant> = None;
+    let mut give_up_deadline: Option<Instant> = None;
     // Shown because of the security check (not --show-browser): hide again after the email step.
     let mut shown_for_check = opts.start_visible && !opts.show_window;
     let mut needed_window = false;
@@ -372,7 +459,13 @@ async fn drive(
                     needed_window = true;
                     helper.show().await;
                     status("Security check: if the login window shows a checkbox, click it.");
+                    if opts.unattended {
+                        give_up_deadline = Some(Instant::now() + UNATTENDED_CHECK_TIMEOUT);
+                    }
                 }
+            }
+            _ = until(give_up_deadline), if give_up_deadline.is_some() => {
+                break Err(Unavailable("the security check needs a person at the login window".into()).into());
             }
             _ = until(code_deadline), if code_deadline.is_some() => {
                 break Err(anyhow!(
@@ -388,10 +481,18 @@ async fn drive(
             }
             msg = rx.recv() => match msg {
                 Some(Msg::HelperGone) | None => {
+                    let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .map(|s| format!(" ({s})"))
+                        .unwrap_or_default();
+                    let tail = stderr_tail.lock().unwrap().trim().to_string();
+                    let why = if tail.is_empty() { String::new() } else { format!(": {tail}") };
                     if ready {
-                        break Err(anyhow!("the login window closed before finishing"));
+                        break Err(anyhow!("the login window stopped before finishing{status}{why}"));
                     }
-                    break Err(Unavailable("the login window couldn't start".into()).into());
+                    break Err(Unavailable(format!("the login window couldn't start{status}{why}")).into());
                 }
 
                 Some(Msg::Helper(ev)) => match ev.event.as_str() {
@@ -423,6 +524,7 @@ async fn drive(
                             }
                             "email_submitted" => {
                                 check_deadline = None;
+                                give_up_deadline = None;
                                 status("Requesting a login code…");
                                 if shown_for_check {
                                     shown_for_check = false;

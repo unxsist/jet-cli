@@ -354,6 +354,7 @@ pub async fn login(
         force_login,
         show_window,
         start_visible,
+        ..
     } = opts;
     let req = LoginRequest::new(tenant, force_login);
     let nonce = super::random_token(18);

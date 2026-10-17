@@ -59,6 +59,7 @@ pub async fn run(command: Command, json: bool) -> Result<()> {
         } => login(&mut ctx, email, manual, fresh, show_browser).await,
         Command::Logout { forget_browser } => logout(&ctx, forget_browser),
         Command::Whoami => whoami(&ctx).await,
+        Command::Doctor => doctor(&ctx).await,
         Command::Auth {
             action: AuthAction::Export,
         } => agent_login::export(&mut ctx).await,
@@ -145,6 +146,14 @@ async fn login(
     show_browser: bool,
 ) -> Result<()> {
     let tenant = ctx.api.tenant.clone();
+    // Not a person at a terminal (agent, script): nothing can be asked here, so hand out what the
+    // two-step login would.
+    if !ui::interactive() {
+        if manual || !webview::can_show_window() {
+            return agent_login::link(ctx, fresh);
+        }
+        return agent_login::start(ctx, email, fresh).await;
+    }
     // No screen here (server, sandbox): log in on another device via a link.
     if manual || !webview::can_show_window() {
         let tokens = auth::login_manual(&ctx.api.http, &tenant, fresh).await?;
@@ -1426,6 +1435,114 @@ async fn order_status(ctx: &mut Ctx) -> Result<()> {
             );
             println!("  {}", status["payment_url"].as_str().unwrap_or_default());
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- doctor
+
+async fn doctor(ctx: &Ctx) -> Result<()> {
+    use serde_json::json;
+    let from_env = !ctx.paths.auth_file().exists() && std::env::var_os("JET_SESSION").is_some();
+    let login = match ctx.api.token().await {
+        Ok(Some(_)) => {
+            let tokens = ctx.api.tokens().await;
+            let account = tokens
+                .as_ref()
+                .and_then(|t| t.claims().ok())
+                .map(|c| display_name(&c));
+            json!({
+                "logged_in": true,
+                "account": account,
+                "source": if from_env { "JET_SESSION" } else { "saved login" },
+            })
+        }
+        Ok(None) => json!({ "logged_in": false }),
+        Err(e) => json!({ "logged_in": false, "problem": format!("{e:#}") }),
+    };
+    let (window, window_detail, helper) = match webview::helper_status() {
+        webview::HelperStatus::Ready(p) => ("ready", None, Some(p)),
+        webview::HelperStatus::Missing => (
+            "missing",
+            Some("jet-webview isn't next to jet or on PATH".to_string()),
+            None,
+        ),
+        webview::HelperStatus::Broken { path, reason } => ("broken", Some(reason), Some(path)),
+        webview::HelperStatus::NoDisplay(p) => (
+            "no_display",
+            Some("no DISPLAY/WAYLAND_DISPLAY".to_string()),
+            Some(p),
+        ),
+    };
+    let report = json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        "login": login,
+        "login_window": {
+            "status": window,
+            "detail": window_detail,
+            "helper": helper,
+            "login_method": if window == "ready" { "window (code typed in terminal/chat)" } else { "link (open on another device, paste the address back)" },
+        },
+        "delivery_address": ctx.config.location.as_ref().map(|l| &l.label),
+        "contact_saved": ctx.config.contact.is_some(),
+        "basket": Current::load(&ctx.paths)?.map(|c| c.restaurant_name),
+        "pending_payment": config::read_json::<checkout::PendingOrder>(&ctx.paths.pending_order_file())?.map(|p| p.restaurant),
+    });
+    if ctx.json {
+        return ui::print_json(&report);
+    }
+    let ok = |b: bool| {
+        if b {
+            console::style("✓").green().to_string()
+        } else {
+            console::style("✗").red().to_string()
+        }
+    };
+    let logged_in = report["login"]["logged_in"].as_bool().unwrap_or(false);
+    println!(
+        "{} Login: {}",
+        ok(logged_in),
+        if logged_in {
+            format!(
+                "{} ({})",
+                report["login"]["account"].as_str().unwrap_or("?"),
+                report["login"]["source"].as_str().unwrap_or_default()
+            )
+        } else {
+            report["login"]["problem"]
+                .as_str()
+                .unwrap_or("not logged in; run `jet login`")
+                .to_string()
+        }
+    );
+    println!(
+        "{} Login window: {}{}",
+        ok(window == "ready"),
+        window,
+        report["login_window"]["detail"]
+            .as_str()
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default()
+    );
+    println!(
+        "  Login method here: {}",
+        report["login_window"]["login_method"]
+            .as_str()
+            .unwrap_or_default()
+    );
+    println!(
+        "{} Delivery address: {}",
+        ok(ctx.config.location.is_some()),
+        report["delivery_address"]
+            .as_str()
+            .unwrap_or("not set; `jet address \"...\"`")
+    );
+    if let Some(b) = report["basket"].as_str() {
+        println!("  Basket: {b}");
+    }
+    if let Some(p) = report["pending_payment"].as_str() {
+        println!("  Waiting for payment: {p} (jet order status)");
     }
     Ok(())
 }
