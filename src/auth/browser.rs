@@ -21,7 +21,8 @@ use tokio::sync::mpsc;
 
 use sha2::{Digest, Sha256};
 
-use super::{LoginRequest, Tokens};
+use super::LoginRequest;
+pub use super::webview::{LoginOptions, LoginOutcome};
 use crate::config::{Paths, Tenant};
 use crate::ui;
 
@@ -340,20 +341,6 @@ const HEADLESS_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// How long to wait for the login page to react to a submitted code.
 const CODE_TIMEOUT: Duration = Duration::from_secs(30);
-
-pub struct LoginOptions {
-    pub force_login: bool,
-    /// Keep the window visible for the whole login (`--show-browser`).
-    pub show_window: bool,
-    /// Start with the window (the security check needed one last time).
-    pub start_visible: bool,
-}
-
-pub struct LoginOutcome {
-    pub tokens: Tokens,
-    /// The security check didn't pass in the hidden browser.
-    pub needed_window: bool,
-}
 
 pub async fn login(
     http: &reqwest::Client,

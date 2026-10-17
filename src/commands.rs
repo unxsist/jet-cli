@@ -3,7 +3,7 @@ use dialoguer::{Confirm, FuzzySelect, Input, MultiSelect, Select};
 use serde_json::json;
 
 use crate::api::Api;
-use crate::auth::{self, Tokens, browser};
+use crate::auth::{self, Tokens, browser, webview};
 use crate::basket::{self, Basket, Current, NewProduct};
 use crate::config::{self, Config, Location, Paths};
 use crate::discovery::{self, Restaurant, ServiceType};
@@ -107,52 +107,61 @@ async fn login(
     show_browser: bool,
 ) -> Result<()> {
     let tenant = ctx.api.tenant.clone();
-    let browser = browser::find_browser(ctx.config.browser.as_deref());
-    let tokens = if manual || browser.is_none() {
-        if !manual {
-            eprintln!(
-                "No Chromium-based browser found (set `browser` in config.toml); using the manual flow."
-            );
-        }
-        auth::login_manual(&ctx.api.http, &tenant, fresh).await?
-    } else {
-        let email: String = match (email, ctx.config.email.clone()) {
-            (Some(e), _) => e,
-            (None, Some(prev)) if ui::interactive() => Input::new()
-                .with_prompt("Email")
-                .default(prev)
-                .interact_text()?,
-            (None, Some(prev)) => prev,
-            (None, None) => Input::new().with_prompt("Email").interact_text()?,
-        };
-        let email: String = email.trim().to_string();
-        // A different account than last time needs a fresh login rather than the remembered session.
-        let switching = ctx
-            .config
-            .email
-            .as_deref()
-            .is_some_and(|prev| !prev.eq_ignore_ascii_case(&email));
-        let now = chrono::Utc::now().timestamp();
-        let outcome = browser::login(
-            &ctx.api.http,
-            &ctx.paths,
-            &tenant,
-            browser.as_deref().unwrap(),
-            &email,
-            browser::LoginOptions {
-                force_login: fresh || switching,
-                show_window: show_browser,
-                start_visible: ctx.config.login_window_until.is_some_and(|t| t > now),
-            },
-        )
-        .await?;
-        if outcome.needed_window {
-            ctx.config.login_window_until = Some(now + 7 * 24 * 3600);
-        }
-        let tokens = outcome.tokens;
-        ctx.config.email = Some(email);
-        tokens
+    if manual {
+        let tokens = auth::login_manual(&ctx.api.http, &tenant, fresh).await?;
+        return finish_login(ctx, tokens);
+    }
+    let email: String = match (email, ctx.config.email.clone()) {
+        (Some(e), _) => e,
+        (None, Some(prev)) if ui::interactive() => Input::new()
+            .with_prompt("Email")
+            .default(prev)
+            .interact_text()?,
+        (None, Some(prev)) => prev,
+        (None, None) => Input::new().with_prompt("Email").interact_text()?,
     };
+    let email = email.trim().to_string();
+    // A different account than last time needs a fresh login rather than the remembered session.
+    let switching = ctx
+        .config
+        .email
+        .as_deref()
+        .is_some_and(|prev| !prev.eq_ignore_ascii_case(&email));
+    let now = chrono::Utc::now().timestamp();
+    let opts = || webview::LoginOptions {
+        force_login: fresh || switching,
+        show_window: show_browser,
+        start_visible: ctx.config.login_window_until.is_some_and(|t| t > now),
+    };
+
+    // The OS web view (jet-webview helper) first; Chromium + extension, then the manual flow,
+    // when it can't run (e.g. no WebKitGTK on Linux).
+    let outcome = match webview::login(&ctx.api.http, &ctx.paths, &tenant, &email, opts()).await {
+        Err(e) if e.is::<webview::Unavailable>() => {
+            if std::env::var_os("JET_DEBUG").is_some() {
+                eprintln!("[debug] {e}");
+            }
+            match browser::find_browser(ctx.config.browser.as_deref()) {
+                Some(b) => {
+                    browser::login(&ctx.api.http, &ctx.paths, &tenant, &b, &email, opts()).await?
+                }
+                None => {
+                    eprintln!("Couldn't open a login window; log in with your browser instead.");
+                    let tokens = auth::login_manual(&ctx.api.http, &tenant, fresh).await?;
+                    return finish_login(ctx, tokens);
+                }
+            }
+        }
+        other => other?,
+    };
+    if outcome.needed_window {
+        ctx.config.login_window_until = Some(now + 7 * 24 * 3600);
+    }
+    ctx.config.email = Some(email);
+    finish_login(ctx, outcome.tokens)
+}
+
+fn finish_login(ctx: &mut Ctx, tokens: Tokens) -> Result<()> {
     tokens.save(&ctx.paths)?;
     ctx.config.save(&ctx.paths)?;
     let claims = tokens.claims()?;
@@ -177,8 +186,12 @@ fn logout(ctx: &Ctx, forget_browser: bool) -> Result<()> {
     if ctx.paths.auth_file().exists() {
         std::fs::remove_file(ctx.paths.auth_file())?;
     }
-    if forget_browser && ctx.paths.browser_profile().exists() {
-        std::fs::remove_dir_all(ctx.paths.browser_profile())?;
+    if forget_browser {
+        for dir in [ctx.paths.browser_profile(), ctx.paths.webview_data()] {
+            if dir.exists() {
+                std::fs::remove_dir_all(dir)?;
+            }
+        }
     }
     eprintln!("Logged out.");
     Ok(())

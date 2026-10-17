@@ -1,4 +1,5 @@
 pub mod browser;
+pub mod webview;
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;

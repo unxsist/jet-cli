@@ -4,11 +4,12 @@ Order food from Just Eat Takeaway ([thuisbezorgd.nl](https://www.thuisbezorgd.nl
 
 Unofficial; it talks to the same APIs as the website, so things may break when they change.
 
-Download a binary for Linux, macOS or Windows from the
-[releases](../../releases), or build it yourself:
+Download a build for Linux, macOS or Windows from the [releases](../../releases) and put both
+`jet` and `jet-webview` somewhere on your PATH (on macOS, first run
+`xattr -dr com.apple.quarantine <unpacked folder>`; the binaries aren't signed). Or build it:
 
 ```sh
-cargo install --path .
+cargo install --git ssh://git@github.com/unxsist/jet-cli.git   # installs jet and jet-webview
 
 jet address "Damrak 1, Amsterdam"     # where to deliver
 jet restaurants pizza --sort rating   # what's open nearby
@@ -25,21 +26,21 @@ accepts `--json` for scripting.
 
 ## Login
 
-`jet login` asks for your email and the emailed code in the terminal. Behind the scenes it runs a
-headless Chromium with a small helper extension that fills in JET's login form. If the site's
-security check won't pass in a hidden browser, a small window opens instead (it fills itself in;
-you still type the code in the terminal) and closes when you're logged in. `--show-browser` always
-shows it. Tokens are refreshed automatically after that, so this is rare.
+`jet login` asks for your email and the emailed code in the terminal. The login page itself runs
+in your OS's built-in web view (WKWebView on macOS, WebView2 on Windows, WebKitGTK on Linux) via the
+small `jet-webview` helper that ships next to `jet`, so no browser needs to be installed. The window
+stays hidden; it only appears for a moment if the site's security check wants a visible page, and
+hides itself again. Tokens are refreshed automatically after that, so logging in is rare.
 
-The login browser runs with its own profile and ignores your `chromium-flags.conf`.
-
-- Needs Chromium or Brave (Google Chrome and Edge no longer allow loading the helper). Set
-  `browser = "/path/to/browser"` in `~/.config/jet-cli/config.toml` to choose one.
-- `jet login --manual` uses your normal browser instead: log in, then paste the URL you land on.
-- `JET_DEBUG=1 jet login` prints what the helper sees.
+- `jet login --show-browser` keeps the window visible; `jet login --manual` uses your normal browser
+  (log in, then paste the URL you land on).
+- Linux needs WebKitGTK 4.1 (`webkit2gtk-4.1` on Arch, `libwebkit2gtk-4.1-0` on Debian/Ubuntu). Without
+  it, `jet login` falls back to Chromium/Brave if installed, otherwise to `--manual`.
+- `JET_DEBUG=1 jet login` prints what the login page does.
 
 Files: `~/.config/jet-cli/` (config, tokens, current basket, mode 0600) and
-`~/.local/share/jet-cli/` (login window profile).
+`~/.local/share/jet-cli/` (login window data). On macOS these live under
+`~/Library/Application Support/jet-cli/`.
 
 See [docs/RESEARCH.md](docs/RESEARCH.md) for the API notes.
 

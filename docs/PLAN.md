@@ -7,9 +7,10 @@ Rust CLI for ordering on Just Eat Takeaway (NL / thuisbezorgd.nl first; tenant k
 - **Language:** Rust (clap, reqwest + rustls, tokio, serde, dialoguer for interactive pickers).
 - **UX:** subcommands with `--json` output; interactive prompts when arguments are missing.
 - **Login:** both flows.
-  - Default: `jet login` asks for the email and code in the terminal and runs Chromium headless with a
-    bundled helper extension (no DevTools protocol); it falls back to a visible window only if the security
-    check doesn't pass within 12 s, or with `--show-browser`. The extension fills in the email, waits for Turnstile
+  - Default: `jet login` asks for the email and code in the terminal; the login page runs in the OS web
+    view (wry: WKWebView / WebView2 / WebKitGTK) inside the `jet-webview` helper binary, hidden unless the
+    security check needs a visible page (then shown briefly and hidden again). Fallbacks: Chromium + helper
+    extension, then `--manual`. The extension fills in the email, waits for Turnstile
     (passes silently in practice), submits, fills in the code you type in the terminal, and hands the
     `/signin-oidc?code=` redirect back to the CLI. The browser profile persists between logins.
   - `jet login --manual`: open the authorize URL in the default browser; the user pastes the final redirect URL.

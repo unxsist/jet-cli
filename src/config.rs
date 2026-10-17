@@ -103,6 +103,10 @@ impl Paths {
     pub fn last_orders_file(&self) -> PathBuf {
         self.config_dir.join("last-orders.json")
     }
+    /// Cookies etc. of the jet-webview login window.
+    pub fn webview_data(&self) -> PathBuf {
+        self.data_dir.join("webview")
+    }
     pub fn browser_profile(&self) -> PathBuf {
         self.data_dir.join("browser-profile")
     }
