@@ -72,7 +72,7 @@ pub struct LoginRequest {
     pub url: String,
 }
 
-fn random_token(len: usize) -> String {
+pub(crate) fn random_token(len: usize) -> String {
     let bytes: Vec<u8> = (0..len).map(|_| rand::random::<u8>()).collect();
     URL_SAFE_NO_PAD.encode(bytes)
 }

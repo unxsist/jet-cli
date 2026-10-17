@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 
 use crate::auth::{self, Tokens};
 use crate::config::{Paths, Tenant};
+use crate::errors;
 
 pub const REST: &str = "https://rest.api.eu-central-1.production.jet-external.com";
 pub const MENU_CDN: &str = "https://globalmenucdn.eu-central-1.production.jet-external.com";
@@ -73,7 +74,9 @@ impl Api {
             return Ok(None);
         };
         if tokens.needs_refresh() {
-            let fresh = auth::refresh(&self.http, &self.tenant, tokens).await?;
+            let fresh = auth::refresh(&self.http, &self.tenant, tokens)
+                .await
+                .map_err(|e| errors::auth_required(format!("{e:#}")))?;
             fresh.save(&self.paths)?;
             *guard = Some(fresh);
         }
@@ -83,7 +86,7 @@ impl Api {
     pub async fn require_token(&self) -> Result<String> {
         self.token()
             .await?
-            .context("not logged in, run `jet login`")
+            .ok_or_else(|| errors::auth_required("not logged in; run `jet login`"))
     }
 
     pub async fn tokens(&self) -> Option<Tokens> {
@@ -136,7 +139,9 @@ impl Api {
                 }
             }
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                bail!("not authorized ({url}); try `jet login`");
+                return Err(errors::auth_required(format!(
+                    "not authorized ({url}); run `jet login`"
+                )));
             }
             bail!(
                 "request to {url} failed ({status}): {}",

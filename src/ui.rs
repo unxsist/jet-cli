@@ -3,6 +3,13 @@ use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// No spinners or progress output (MCP server mode: the terminal isn't ours).
+pub fn set_quiet() {
+    QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// A spinner that can be paused while the user is typing at a prompt.
 pub struct Status {
     bar: Option<ProgressBar>,
@@ -16,7 +23,7 @@ impl Status {
     }
 
     pub fn set(&mut self, msg: &str) {
-        if !console::Term::stderr().is_term() {
+        if QUIET.load(std::sync::atomic::Ordering::Relaxed) || !console::Term::stderr().is_term() {
             return;
         }
         let bar = self.bar.get_or_insert_with(|| {
@@ -129,5 +136,7 @@ pub fn bold(s: &str) -> String {
 }
 
 pub fn interactive() -> bool {
-    console::Term::stdout().is_term() && console::Term::stderr().is_term()
+    !QUIET.load(std::sync::atomic::Ordering::Relaxed)
+        && console::Term::stdout().is_term()
+        && console::Term::stderr().is_term()
 }

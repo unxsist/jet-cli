@@ -1,10 +1,14 @@
+mod agent_login;
 mod api;
 mod auth;
 mod basket;
+mod checkout;
 mod commands;
 mod config;
 mod discovery;
+mod errors;
 mod geo;
+mod mcp;
 mod menu;
 mod orders;
 mod ui;
@@ -29,6 +33,8 @@ struct Cli {
 pub enum Command {
     /// Log in with the email code flow.
     Login {
+        #[command(subcommand)]
+        step: Option<LoginStep>,
         /// Email address to log in with (defaults to the last one used).
         #[arg(long)]
         email: Option<String>,
@@ -123,11 +129,36 @@ pub enum Command {
         #[arg(long)]
         new: bool,
     },
+    /// Run as an MCP server on stdio, for AI agents (e.g. `claude mcp add jet -- jet mcp`).
+    Mcp,
     /// Show or change the basket.
     #[command(alias = "b")]
     Basket {
         #[command(subcommand)]
         action: Option<BasketAction>,
+    },
+}
+
+/// Two-step login for agents and scripts.
+#[derive(Subcommand)]
+pub enum LoginStep {
+    /// Send a login code and wait in the background for `jet login code`.
+    Start {
+        #[arg(long)]
+        email: Option<String>,
+        /// Ignore any remembered session and log in again.
+        #[arg(long)]
+        fresh: bool,
+    },
+    /// Finish a login started with `jet login start`.
+    Code { code: String },
+    /// Internal: the background half of `jet login start`.
+    #[command(hide = true)]
+    Daemon {
+        #[arg(long)]
+        email: String,
+        #[arg(long)]
+        fresh: bool,
     },
 }
 
@@ -168,8 +199,21 @@ async fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let cli = Cli::parse();
-    if let Err(e) = commands::run(cli.command, cli.json).await {
-        eprintln!("{} {e:#}", console::style("error:").red().bold());
-        std::process::exit(1);
+    let json = cli.json;
+    let result = match cli.command {
+        Command::Mcp => mcp::serve().await,
+        command => commands::run(command, json).await,
+    };
+    if let Err(e) = result {
+        let kind = e.downcast_ref::<errors::JetError>().map(|j| j.kind);
+        if json {
+            let error = serde_json::json!({
+                "error": { "kind": kind.map_or("error", |k| k.name()), "message": format!("{e:#}") }
+            });
+            println!("{error}");
+        } else {
+            eprintln!("{} {e:#}", console::style("error:").red().bold());
+        }
+        std::process::exit(kind.map_or(1, |k| k.exit_code()));
     }
 }

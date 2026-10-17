@@ -205,8 +205,14 @@ pub async fn fetch(
     let t = &api.tenant.code;
     let manifest: Manifest = cdn(api, &format!("{slug}_{t}_manifest.json"))
         .await
-        .with_context(|| {
-            format!("no menu found for '{slug}' (use the slug from `jet restaurants`)")
+        .map_err(|e| {
+            if e.to_string().contains("404") {
+                crate::errors::input_error(format!(
+                    "no restaurant '{slug}'; use a number, name or slug from `jet restaurants`"
+                ))
+            } else {
+                e
+            }
         })?;
     let (items, details, dynamic) = tokio::join!(
         cdn::<ItemsFile>(api, &manifest.items_url),

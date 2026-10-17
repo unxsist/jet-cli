@@ -7,32 +7,47 @@ use crate::auth::{self, Tokens, browser, webview};
 use crate::basket::{self, Basket, Current, NewProduct};
 use crate::config::{self, Config, Location, Paths};
 use crate::discovery::{self, Restaurant, ServiceType};
+use crate::errors::needs_input;
 use crate::menu::{self, Item, Menu};
 use crate::orders;
 use crate::ui::{self, bold, dim, euros, euros_cents};
-use crate::{BasketAction, Command, Sort, service};
+use crate::{BasketAction, Command, LoginStep, Sort, agent_login, service};
 
-struct Ctx {
-    paths: Paths,
-    config: Config,
-    api: Api,
-    json: bool,
+pub(crate) struct Ctx {
+    pub(crate) paths: Paths,
+    pub(crate) config: Config,
+    pub(crate) api: Api,
+    pub(crate) json: bool,
+}
+
+impl Ctx {
+    pub(crate) fn new(json: bool) -> Result<Self> {
+        let paths = Paths::new()?;
+        let config = Config::load(&paths)?;
+        let tenant = config::tenant(&config.tenant)?;
+        let api = Api::new(paths.clone(), tenant)?;
+        Ok(Ctx {
+            paths,
+            config,
+            api,
+            json,
+        })
+    }
 }
 
 pub async fn run(command: Command, json: bool) -> Result<()> {
-    let paths = Paths::new()?;
-    let config = Config::load(&paths)?;
-    let tenant = config::tenant(&config.tenant)?;
-    let api = Api::new(paths.clone(), tenant)?;
-    let mut ctx = Ctx {
-        paths,
-        config,
-        api,
-        json,
-    };
+    let mut ctx = Ctx::new(json)?;
 
     match command {
         Command::Login {
+            step: Some(step), ..
+        } => match step {
+            LoginStep::Start { email, fresh } => agent_login::start(&mut ctx, email, fresh).await,
+            LoginStep::Code { code } => agent_login::submit(&mut ctx, &code).await,
+            LoginStep::Daemon { email, fresh } => agent_login::daemon(ctx, email, fresh).await,
+        },
+        Command::Login {
+            step: None,
             email,
             manual,
             fresh,
@@ -91,6 +106,7 @@ pub async fn run(command: Command, json: bool) -> Result<()> {
         }
         Command::Orders { limit } => orders(&mut ctx, limit).await,
         Command::Reorder { number, new } => reorder(&mut ctx, number, new).await,
+        Command::Mcp => unreachable!("handled in main"),
         Command::Basket { action } => {
             basket_cmd(&mut ctx, action.unwrap_or(crate::BasketAction::Show)).await
         }
@@ -121,18 +137,7 @@ async fn login(
         (None, None) => Input::new().with_prompt("Email").interact_text()?,
     };
     let email = email.trim().to_string();
-    // A different account than last time needs a fresh login rather than the remembered session.
-    let switching = ctx
-        .config
-        .email
-        .as_deref()
-        .is_some_and(|prev| !prev.eq_ignore_ascii_case(&email));
-    let now = chrono::Utc::now().timestamp();
-    let opts = || webview::LoginOptions {
-        force_login: fresh || switching,
-        show_window: show_browser,
-        start_visible: ctx.config.login_window_until.is_some_and(|t| t > now),
-    };
+    let opts = || agent_login::login_options(&ctx.config, &email, fresh, show_browser);
 
     // The OS web view (jet-webview helper) first; Chromium + extension, then the manual flow,
     // when it can't run (e.g. no WebKitGTK on Linux).
@@ -154,11 +159,9 @@ async fn login(
         }
         other => other?,
     };
-    if outcome.needed_window {
-        ctx.config.login_window_until = Some(now + 7 * 24 * 3600);
-    }
-    ctx.config.email = Some(email);
-    finish_login(ctx, outcome.tokens)
+    let name = agent_login::record_success(&ctx.paths, &mut ctx.config, &email, &outcome)?;
+    eprintln!("Logged in as {name}.");
+    Ok(())
 }
 
 fn finish_login(ctx: &mut Ctx, tokens: Tokens) -> Result<()> {
@@ -169,7 +172,7 @@ fn finish_login(ctx: &mut Ctx, tokens: Tokens) -> Result<()> {
     Ok(())
 }
 
-fn display_name(claims: &serde_json::Value) -> String {
+pub(crate) fn display_name(claims: &serde_json::Value) -> String {
     let s = |k: &str| claims[k].as_str().unwrap_or_default().to_string();
     let name = format!("{} {}", s("given_name"), s("family_name"))
         .trim()
@@ -213,7 +216,7 @@ async fn whoami(ctx: &Ctx) -> Result<()> {
 
 // ---------------------------------------------------------------- location
 
-async fn address(ctx: &mut Ctx, query: &str) -> Result<()> {
+pub(crate) async fn address(ctx: &mut Ctx, query: &str) -> Result<()> {
     if query.trim().is_empty() {
         match &ctx.config.location {
             Some(l) if ctx.json => ui::print_json(l)?,
@@ -240,7 +243,9 @@ async fn location(ctx: &mut Ctx) -> Result<Location> {
         return Ok(l.clone());
     }
     if !ui::interactive() {
-        bail!("no delivery address set; run `jet address \"<street> <number>, <postcode>\"`");
+        needs_input!(
+            "no delivery address set; run `jet address \"<street> <number>, <postcode>\"`"
+        );
     }
     let q: String = Input::new()
         .with_prompt("Delivery address (street + number, postcode)")
@@ -251,14 +256,15 @@ async fn location(ctx: &mut Ctx) -> Result<Location> {
 
 // ---------------------------------------------------------------- restaurants
 
-async fn restaurants(
+/// Restaurants near the delivery address, filtered and sorted; remembered for `jet menu <n>`.
+pub(crate) async fn find_restaurants(
     ctx: &mut Ctx,
     query: &str,
     all: bool,
     svc: ServiceType,
     sort: Sort,
     limit: usize,
-) -> Result<()> {
+) -> Result<(Location, Vec<Restaurant>)> {
     let loc = location(ctx).await?;
     let mut list =
         ui::with_spinner("Finding restaurants…", discovery::near(&ctx.api, &loc, svc)).await?;
@@ -279,7 +285,21 @@ async fn restaurants(
     // Stable sort: keeps the chosen order, open restaurants first.
     list.sort_by_key(|r| !r.open);
     list.truncate(limit);
+    // Remember the listing so `jet menu 3` refers to the third restaurant shown.
+    let slugs: Vec<&str> = list.iter().map(|r| r.slug.as_str()).collect();
+    config::write_json(&ctx.paths.last_list_file(), &slugs)?;
+    Ok((loc, list))
+}
 
+async fn restaurants(
+    ctx: &mut Ctx,
+    query: &str,
+    all: bool,
+    svc: ServiceType,
+    sort: Sort,
+    limit: usize,
+) -> Result<()> {
+    let (loc, list) = find_restaurants(ctx, query, all, svc, sort, limit).await?;
     if ctx.json {
         return ui::print_json(&list);
     }
@@ -291,10 +311,6 @@ async fn restaurants(
         );
         return Ok(());
     }
-    // Remember the listing so `jet menu 3` refers to the third restaurant shown.
-    let slugs: Vec<&str> = list.iter().map(|r| r.slug.as_str()).collect();
-    config::write_json(&ctx.paths.last_list_file(), &slugs)?;
-
     let w = ui::width();
     let num_w = list.len().to_string().len();
     let indent = " ".repeat(num_w + 2);
@@ -384,7 +400,7 @@ async fn resolve_restaurant(ctx: &mut Ctx, query: &str, svc: ServiceType) -> Res
     };
     match matches.len() {
         0 if looks_like_slug => Ok(q.to_string()),
-        0 => bail!("no restaurant matching '{q}' near {}", loc.label),
+        0 => needs_input!("no restaurant matching '{q}' near {}", loc.label),
         1 => Ok(matches[0].slug.clone()),
         _ if ui::interactive() => {
             let labels: Vec<String> = matches
@@ -405,7 +421,7 @@ async fn resolve_restaurant(ctx: &mut Ctx, query: &str, svc: ServiceType) -> Res
                 .interact()?;
             Ok(matches[i].slug.clone())
         }
-        _ => bail!(
+        _ => needs_input!(
             "'{q}' matches several restaurants: {}",
             matches
                 .iter()
@@ -418,13 +434,17 @@ async fn resolve_restaurant(ctx: &mut Ctx, query: &str, svc: ServiceType) -> Res
 
 // ---------------------------------------------------------------- menu
 
-async fn load_menu(ctx: &mut Ctx, restaurant: Option<String>, svc: ServiceType) -> Result<Menu> {
+pub(crate) async fn load_menu(
+    ctx: &mut Ctx,
+    restaurant: Option<String>,
+    svc: ServiceType,
+) -> Result<Menu> {
     let current = Current::load(&ctx.paths)?;
     let slug = match restaurant {
         Some(r) => resolve_restaurant(ctx, &r, svc).await?,
         None => match &current {
             Some(c) => c.restaurant_slug.clone(),
-            None => bail!("which restaurant? Pass a slug or name (see `jet restaurants`)"),
+            None => needs_input!("which restaurant? Pass a slug or name (see `jet restaurants`)"),
         },
     };
     let loc = ctx.config.location.clone();
@@ -508,18 +528,19 @@ async fn show_menu(
 
 // ---------------------------------------------------------------- add
 
-struct AddArgs {
-    item: Option<String>,
-    restaurant: Option<String>,
-    size: Option<String>,
-    options: Vec<String>,
-    quantity: u32,
-    note: String,
-    pickup: bool,
-    new: bool,
+pub(crate) struct AddArgs {
+    pub(crate) item: Option<String>,
+    pub(crate) restaurant: Option<String>,
+    pub(crate) size: Option<String>,
+    pub(crate) options: Vec<String>,
+    pub(crate) quantity: u32,
+    pub(crate) note: String,
+    pub(crate) pickup: bool,
+    pub(crate) new: bool,
 }
 
-async fn add(ctx: &mut Ctx, a: AddArgs) -> Result<()> {
+/// Adds an item; returns the basket, the restaurant name and what was added.
+pub(crate) async fn add_core(ctx: &mut Ctx, a: AddArgs) -> Result<(Basket, String, String)> {
     let svc = match &Current::load(&ctx.paths)? {
         Some(c) if a.restaurant.is_none() && c.service_type == "collection" => {
             ServiceType::Collection
@@ -541,10 +562,16 @@ async fn add(ctx: &mut Ctx, a: AddArgs) -> Result<()> {
         std::slice::from_ref(&product),
     )
     .await?;
+    let added = format!("Added {}× {}.", product.quantity, item.name);
+    Ok((basket, menu.name, added))
+}
+
+async fn add(ctx: &mut Ctx, a: AddArgs) -> Result<()> {
+    let (basket, restaurant, added) = add_core(ctx, a).await?;
     if !ctx.json {
-        eprintln!("Added {}× {}.", product.quantity, item.name);
+        eprintln!("{added}");
     }
-    print_basket(ctx, &basket, &menu.name)
+    print_basket(ctx, &basket, &restaurant)
 }
 
 /// The current basket if it's at `menu`'s restaurant. A basket elsewhere is discarded, after
@@ -569,7 +596,7 @@ fn basket_for(ctx: &Ctx, menu: &Menu, new: bool) -> Result<Option<Current>> {
                 .default(false)
                 .interact()?);
     if !ok {
-        bail!(
+        needs_input!(
             "basket is from {}; pass --new to start over at {}",
             c.restaurant_name,
             menu.name
@@ -652,7 +679,7 @@ fn pick_item<'m>(menu: &'m Menu, query: Option<&str>) -> Result<&'m Item> {
         None => menu.items.iter().filter(|i| i.available()).collect(),
     };
     match candidates.len() {
-        0 => bail!(
+        0 => needs_input!(
             "no item matching '{}' on the menu of {}",
             query.unwrap_or_default(),
             menu.name
@@ -667,7 +694,7 @@ fn pick_item<'m>(menu: &'m Menu, query: Option<&str>) -> Result<&'m Item> {
                 .interact()?;
             Ok(candidates[i])
         }
-        _ => bail!(
+        _ => needs_input!(
             "'{}' matches several items: {}",
             query.unwrap_or_default(),
             candidates
@@ -697,7 +724,7 @@ fn configure(menu: &Menu, item: &Item, a: &AddArgs) -> Result<NewProduct> {
             .collect();
         match found.as_slice() {
             [v] => **v,
-            _ => bail!(
+            _ => needs_input!(
                 "size '{size}' doesn't match exactly one of: {}",
                 variations
                     .iter()
@@ -721,7 +748,7 @@ fn configure(menu: &Menu, item: &Item, a: &AddArgs) -> Result<NewProduct> {
             .interact()?;
         variations[i]
     } else {
-        bail!(
+        needs_input!(
             "{} comes in several sizes; pass --size ({})",
             item.name,
             variations
@@ -768,7 +795,7 @@ fn configure(menu: &Menu, item: &Item, a: &AddArgs) -> Result<NewProduct> {
         }
         let n = chosen.len() as u32;
         if n < group.min || n > group.max {
-            bail!(
+            needs_input!(
                 "{}: choose {} for '{}' with -o ({})",
                 item.name,
                 range_text(group.min, group.max),
@@ -788,7 +815,7 @@ fn configure(menu: &Menu, item: &Item, a: &AddArgs) -> Result<NewProduct> {
         }
     }
     if let Some(i) = used.iter().position(|u| !u) {
-        bail!("option '{}' doesn't exist for {}", a.options[i], item.name);
+        needs_input!("option '{}' doesn't exist for {}", a.options[i], item.name);
     }
     Ok(NewProduct {
         variation_id: variation.id.clone(),
@@ -909,7 +936,13 @@ async fn orders(ctx: &mut Ctx, limit: usize) -> Result<()> {
     Ok(())
 }
 
-async fn reorder(ctx: &mut Ctx, number: usize, new: bool) -> Result<()> {
+/// Puts order `number` (1 = most recent) back in the basket; returns the basket, restaurant name
+/// and a summary (including skipped items).
+pub(crate) async fn reorder_core(
+    ctx: &mut Ctx,
+    number: usize,
+    new: bool,
+) -> Result<(Basket, String, String)> {
     let cached: Option<Vec<orders::Order>> = config::read_json(&ctx.paths.last_orders_file())?;
     let list = match cached {
         Some(l) if l.len() >= number => l,
@@ -924,10 +957,11 @@ async fn reorder(ctx: &mut Ctx, number: usize, new: bool) -> Result<()> {
     let menu = load_menu(ctx, Some(order.restaurant.seo_name.clone()), svc).await?;
 
     let mut products = Vec::new();
+    let mut skipped = Vec::new();
     for it in &order.basket.summary.items {
         match product_from_order(&menu, it) {
             Ok(p) => products.push(p),
-            Err(e) => eprintln!("Skipping {}: {e:#}", it.name),
+            Err(e) => skipped.push(format!("Skipped {}: {e:#}.", it.name)),
         }
     }
     if products.is_empty() {
@@ -938,15 +972,21 @@ async fn reorder(ctx: &mut Ctx, number: usize, new: bool) -> Result<()> {
     }
     let current = basket_for(ctx, &menu, new)?;
     let basket = put_products(ctx, &menu, svc, &loc, current, &products).await?;
+    skipped.push(format!(
+        "Added {} of {} items from your order of {}.",
+        products.len(),
+        order.basket.summary.items.len(),
+        order.restaurant.display_name
+    ));
+    Ok((basket, menu.name, skipped.join("\n")))
+}
+
+async fn reorder(ctx: &mut Ctx, number: usize, new: bool) -> Result<()> {
+    let (basket, restaurant, summary) = reorder_core(ctx, number, new).await?;
     if !ctx.json {
-        eprintln!(
-            "Added {} of {} items from your order of {}.",
-            products.len(),
-            order.basket.summary.items.len(),
-            order.restaurant.display_name
-        );
+        eprintln!("{summary}");
     }
-    print_basket(ctx, &basket, &menu.name)
+    print_basket(ctx, &basket, &restaurant)
 }
 
 /// Rebuilds an ordered item against today's menu (ids are stable; availability may not be).
@@ -987,13 +1027,13 @@ fn product_from_order(menu: &Menu, it: &orders::OrderItem) -> Result<NewProduct>
 
 // ---------------------------------------------------------------- basket
 
-async fn basket_cmd(ctx: &mut Ctx, action: BasketAction) -> Result<()> {
+/// Shows or changes the basket; None when there is no basket (or it was cleared).
+pub(crate) async fn basket_core(
+    ctx: &mut Ctx,
+    action: BasketAction,
+) -> Result<Option<(Basket, String)>> {
     let Some(current) = Current::load(&ctx.paths)? else {
-        if ctx.json {
-            return ui::print_json(&serde_json::Value::Null);
-        }
-        eprintln!("Your basket is empty. Find something with `jet restaurants`.");
-        return Ok(());
+        return Ok(None);
     };
     let fetched =
         match ui::with_spinner("Loading basket…", basket::get(&ctx.api, &current.basket_id)).await
@@ -1026,16 +1066,29 @@ async fn basket_cmd(ctx: &mut Ctx, action: BasketAction) -> Result<()> {
         }
         BasketAction::Clear => {
             Current::clear(&ctx.paths)?;
-            if !ctx.json {
-                eprintln!("Basket cleared.");
-            }
-            return Ok(());
+            return Ok(None);
         }
     };
     if updated.basket_summary.products.is_empty() {
         Current::clear(&ctx.paths)?;
     }
-    print_basket(ctx, &updated, &current.restaurant_name)
+    Ok(Some((updated, current.restaurant_name)))
+}
+
+async fn basket_cmd(ctx: &mut Ctx, action: BasketAction) -> Result<()> {
+    let clearing = matches!(action, BasketAction::Clear);
+    match basket_core(ctx, action).await? {
+        Some((basket, restaurant)) => print_basket(ctx, &basket, &restaurant),
+        None if ctx.json => ui::print_json(&serde_json::Value::Null),
+        None if clearing => {
+            eprintln!("Basket cleared.");
+            Ok(())
+        }
+        None => {
+            eprintln!("Your basket is empty. Find something with `jet restaurants`.");
+            Ok(())
+        }
+    }
 }
 
 fn print_basket(ctx: &Ctx, b: &Basket, restaurant: &str) -> Result<()> {
