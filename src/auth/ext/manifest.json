@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "jet-cli login helper",
+  "description": "Fills in your email and the code you type in the terminal, and hands the login result back to jet-cli.",
+  "version": "1.0",
+  "permissions": [
+    "webRequest",
+    "tabs",
+    "storage"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://__AUTH_HOST__/*",
+    "https://__SITE_HOST__/*"
+  ],
+  "background": {
+    "service_worker": "bg.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://__AUTH_HOST__/*",
+        "http://127.0.0.1/*"
+      ],
+      "js": [
+        "cs.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
