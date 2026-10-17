@@ -45,9 +45,8 @@ enum Msg {
 
 struct Shared {
     email: String,
-    /// Where the local start page sends the browser next (the authorize URL, or the code page
-    /// when a hidden browser takes over from the window).
-    next_url: Mutex<String>,
+    /// Where the local start page sends the browser next (the authorize URL).
+    next_url: String,
     otp: Mutex<(u64, String)>,
     tx: mpsc::UnboundedSender<Msg>,
 }
@@ -135,7 +134,7 @@ async fn serve(shared: Arc<Shared>, nonce: &str) -> Result<u16> {
         .route(
             &p("/start"),
             get(|State(s): State<Arc<Shared>>| async move {
-                let next = s.next_url.lock().unwrap().clone();
+                let next = s.next_url.clone();
                 Html(format!(
                     "<!doctype html><meta charset=utf-8><title>jet-cli login</title>\
                      <body data-auth-url=\"{}\" style=\"font:16px system-ui;display:grid;place-items:center;height:90vh\">\
@@ -339,12 +338,14 @@ async fn close(mut child: Child) {
 /// How long the hidden browser may wait for the security check before we show it to the user.
 const HEADLESS_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// How long to wait for the login page to react to a submitted code.
+const CODE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct LoginOptions {
     pub force_login: bool,
     /// Keep the window visible for the whole login (`--show-browser`).
     pub show_window: bool,
-    /// Start with the window for the security check (it needed one last time), still hiding it
-    /// for the code step.
+    /// Start with the window (the security check needed one last time).
     pub start_visible: bool,
 }
 
@@ -372,7 +373,7 @@ pub async fn login(
     let (tx, mut rx) = mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
         email: email.to_string(),
-        next_url: Mutex::new(req.url.clone()),
+        next_url: req.url.clone(),
         otp: Mutex::new((0, String::new())),
         tx: tx.clone(),
     });
@@ -399,14 +400,11 @@ pub async fn login(
     // Set once the server accepted the code; the page then needs a few seconds to redirect.
     let mut code_accepted = false;
     let mut prompted = false;
-    // The security check only guards the email step. If the window had to be shown for it, a
-    // hidden browser takes over on the code page so the window is only up for a few seconds.
-    let mut code_page: Option<String> = None;
-    let mut handed_off = false;
+    // After submitting a code we expect an answer quickly; never wait silently.
+    let mut code_deadline: Option<tokio::time::Instant> = None;
 
     let result: Result<String> = loop {
         let mut show_reason: Option<&str> = None;
-        let mut hide = false;
         tokio::select! {
             _ = &mut deadline => break Err(anyhow::anyhow!("login timed out")),
             _ = terminated() => break Err(anyhow::anyhow!("login cancelled")),
@@ -419,6 +417,14 @@ pub async fn login(
             {
                 show_reason = Some("The security check needs you; opening a login window.");
             }
+            _ = tokio::time::sleep_until(code_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if code_deadline.is_some() =>
+            {
+                break Err(anyhow::anyhow!(
+                    "no response from the login page after submitting the code; \
+                     run `JET_DEBUG=1 jet login` to see what it's doing"
+                ));
+            }
             status = child.wait() => {
                 break Err(anyhow::anyhow!("the login window was closed before finishing ({})", status?));
             }
@@ -430,6 +436,7 @@ pub async fn login(
                     otp.0 += 1;
                     otp.1 = code;
                     status.set("Checking code…");
+                    code_deadline = Some(tokio::time::Instant::now() + CODE_TIMEOUT);
                 }
                 Some(Msg::Ext(ev)) => {
                     ready = true;
@@ -446,12 +453,6 @@ pub async fn login(
                                     "There's no account for {email} yet. Finish signing up in the window."
                                 ));
                             }
-                        }
-                        "page" if detail.contains("/mfa") => code_page = Some(detail.clone()),
-                        "page" if detail.contains("/login") && handed_off && headless => {
-                            // The hidden browser lost the session; finish in the window.
-                            show_reason = Some("Couldn't continue in the background; finishing in the login window.");
-                            *shared.next_url.lock().unwrap() = req.url.clone();
                         }
                         "page" if detail.contains("/login") => {
                             status.set(&format!("Logging in as {email}…"));
@@ -483,19 +484,17 @@ pub async fn login(
                                 eprintln!("A login code was sent to {email}.");
                                 prompt_code(tx.clone());
                             }
-                            if !headless && !show_window && !handed_off && let Some(url) = &code_page {
-                                *shared.next_url.lock().unwrap() = url.clone();
-                                handed_off = true;
-                                hide = true;
-                            }
                         }
                         "api" if detail.contains("/otp/validate") => {
                             if detail.ends_with(" 200") {
                                 code_accepted = true;
                                 status.set("Finishing login…");
+                                // Allow time for the redirect back to the site.
+                                code_deadline = Some(tokio::time::Instant::now() + CODE_TIMEOUT);
                             }
                         }
                         "otp_error" if !code_accepted => {
+                            code_deadline = None;
                             status.pause();
                             eprintln!("That code didn't work ({detail}).");
                             prompt_code(tx.clone());
@@ -504,11 +503,6 @@ pub async fn login(
                     }
                 }
             }
-        }
-        if hide {
-            close(child).await;
-            headless = true;
-            child = launch(browser, paths, &extension, &start_url, true)?;
         }
         if let Some(reason) = show_reason {
             needed_window = true;

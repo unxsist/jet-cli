@@ -27,9 +27,9 @@ accepts `--json` for scripting.
 
 `jet login` asks for your email and the emailed code in the terminal. Behind the scenes it runs a
 headless Chromium with a small helper extension that fills in JET's login form. If the site's
-security check won't pass in a hidden browser, a small window opens for the email step only (a few
-seconds; it fills itself in) and a hidden browser takes over for the code. `--show-browser` keeps
-the window open throughout. Tokens are refreshed automatically after that, so this is rare.
+security check won't pass in a hidden browser, a small window opens instead (it fills itself in;
+you still type the code in the terminal) and closes when you're logged in. `--show-browser` always
+shows it. Tokens are refreshed automatically after that, so this is rare.
 
 The login browser runs with its own profile and ignores your `chromium-flags.conf`.
 
