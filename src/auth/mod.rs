@@ -64,6 +64,7 @@ pub fn jwt_claims(jwt: &str) -> Result<serde_json::Value> {
 }
 
 /// One login attempt: PKCE verifier + state, and the URL that starts it.
+#[derive(Serialize, Deserialize)]
 pub struct LoginRequest {
     auth_base: String,
     pub verifier: String,
@@ -79,11 +80,29 @@ pub(crate) fn random_token(len: usize) -> String {
 
 impl LoginRequest {
     pub fn new(tenant: &Tenant, force_login: bool) -> Self {
+        // The web client only accepts callbacks on the site itself, not a loopback address.
+        Self::with_redirect(
+            tenant,
+            force_login,
+            format!("https://{}/signin-oidc", tenant.site_host),
+        )
+    }
+
+    /// For logins finished on another device: the browser ends on a static page (no script
+    /// redirects away), so the address with the code stays visible to copy. The code is useless
+    /// without this request's PKCE verifier, so it's safe to paste into a chat.
+    pub fn for_link(tenant: &Tenant, force_login: bool) -> Self {
+        Self::with_redirect(
+            tenant,
+            force_login,
+            format!("https://{}/robots.txt", tenant.site_host),
+        )
+    }
+
+    fn with_redirect(tenant: &Tenant, force_login: bool, redirect_uri: String) -> Self {
         let verifier = random_token(48);
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let state = random_token(16);
-        // The web client only accepts the site's own callback, not a loopback address.
-        let redirect_uri = format!("https://{}/signin-oidc", tenant.site_host);
         let auth_base = tenant.auth_base();
         let mut url = Url::parse(&format!("{auth_base}/connect/authorize")).unwrap();
         url.query_pairs_mut()
@@ -108,9 +127,16 @@ impl LoginRequest {
         }
     }
 
-    /// Extracts the authorization code from the URL the browser was redirected to.
+    /// Extracts the authorization code from the URL the browser was redirected to (or takes a
+    /// bare code).
     pub fn code_from_redirect(&self, redirected: &str) -> Result<String> {
-        let url = Url::parse(redirected.trim()).context("that doesn't look like a URL")?;
+        let pasted = redirected
+            .trim()
+            .trim_matches(|c| c == '\'' || c == '"' || c == '<' || c == '>');
+        if !pasted.contains("://") && !pasted.contains("code=") && !pasted.is_empty() {
+            return Ok(pasted.to_string());
+        }
+        let url = Url::parse(pasted).context("that doesn't look like the address of the page")?;
         let param = |name: &str| {
             url.query_pairs()
                 .find(|(k, _)| k == name)
@@ -199,27 +225,65 @@ async fn token_request(
     })
 }
 
-/// Fallback flow: the user logs in with their normal browser and pastes the final URL.
+/// Prints a login link (and QR code) to open on any device.
+pub fn print_link(url: &str) {
+    eprintln!("Open this link on your phone or computer and log in:\n\n  {url}\n");
+    if let Ok(code) = qrcode::QrCode::new(url.as_bytes()) {
+        let qr = code
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .quiet_zone(true)
+            .build();
+        eprintln!("{qr}");
+    }
+    eprintln!(
+        "After logging in you end on a page of plain text (robots.txt).\n\
+         Copy the full address of that page and paste it here."
+    );
+}
+
+/// Login in any browser (another device too): open the link, log in, paste the final address.
 pub async fn login_manual(
     http: &reqwest::Client,
     tenant: &Tenant,
     force_login: bool,
 ) -> Result<Tokens> {
-    let req = LoginRequest::new(tenant, force_login);
-    eprintln!("Open this URL and log in:\n\n  {}\n", req.url);
+    let req = LoginRequest::for_link(tenant, force_login);
+    print_link(&req.url);
     let _ = open::that_detached(&req.url);
-    eprintln!(
-        "After logging in you'll land on https://{}/signin-oidc?code=...\n\
-         Copy that full URL from the address bar (or from your history) and paste it here.",
-        tenant.site_host
-    );
     loop {
         let pasted: String = dialoguer::Input::new()
-            .with_prompt("Redirect URL")
+            .with_prompt("Address")
             .interact_text()?;
         match req.code_from_redirect(&pasted) {
             Ok(code) => return req.exchange(http, &code).await,
             Err(e) => eprintln!("{e:#}"),
         }
     }
+}
+
+/// A link login waiting for its pasted address (`jet login link` / MCP in a sandbox).
+fn pending_link_file(paths: &Paths) -> std::path::PathBuf {
+    paths.config_dir.join("login-link.json")
+}
+
+pub fn start_link(paths: &Paths, tenant: &Tenant, force_login: bool) -> Result<String> {
+    let req = LoginRequest::for_link(tenant, force_login);
+    write_json(&pending_link_file(paths), &req)?;
+    Ok(req.url)
+}
+
+pub fn has_pending_link(paths: &Paths) -> bool {
+    pending_link_file(paths).exists()
+}
+
+pub async fn finish_link(http: &reqwest::Client, paths: &Paths, pasted: &str) -> Result<Tokens> {
+    let req: LoginRequest = read_json(&pending_link_file(paths))?.ok_or_else(|| {
+        crate::errors::input_error("no login link was started; run `jet login link` first")
+    })?;
+    let code = req
+        .code_from_redirect(pasted)
+        .map_err(|e| crate::errors::input_error(format!("{e:#}")))?;
+    let tokens = req.exchange(http, &code).await?;
+    let _ = std::fs::remove_file(pending_link_file(paths));
+    Ok(tokens)
 }

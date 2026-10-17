@@ -26,8 +26,13 @@ Tenant for NL is `nl`; most paths are `/{area}/{tenant}/...` and requests carry 
   - Accepted `redirect_uri`: `https://www.thuisbezorgd.nl/signin-oidc` (query string allowed).
     Loopback (`http://127.0.0.1:*`, `http://localhost`) is **rejected**.
   - Device authorization: `unauthorized_client` for `consumer_web_je`.
+- Redirect URIs: any URL on the brand host is accepted (host-level match), e.g.
+  `https://www.thuisbezorgd.nl/robots.txt`. `jet login link` uses that one: a static file, so the
+  `?code=&state=` stays in the address bar for the user to copy (the site's `/signin-oidc` page
+  immediately redirects home). PKCE keeps the code useless without the verifier.
 - Refresh: `POST /connect/token` form `client_id=consumer_web_je&grant_type=refresh_token&refresh_token=...`.
-  No captcha.
+  No captcha. Refresh tokens rotate, but earlier ones keep working, so a login can be copied to
+  another machine (`jet auth export` / `JET_SESSION`) without logging the original out.
 - BFF token for cw-api: `POST /connect/token` with `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`,
   `requested_token_type=urn:ietf:params:oauth:token-type:access_token_bff`,
   `subject_token=<access_token>`, `subject_token_type=urn:ietf:params:oauth:token-type:access_token`, `tenant=nl`.

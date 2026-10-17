@@ -54,6 +54,19 @@ impl std::fmt::Display for Unavailable {
 
 impl std::error::Error for Unavailable {}
 
+/// Whether a login window can be shown here at all (a desktop session with the helper installed;
+/// not e.g. a headless server or cloud sandbox).
+pub fn can_show_window() -> bool {
+    if find_helper().is_none() {
+        return false;
+    }
+    if cfg!(target_os = "linux") {
+        return std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    }
+    true
+}
+
 /// `jet-webview` next to the running `jet` (release archives and `cargo install` put them
 /// together), else on PATH.
 pub fn find_helper() -> Option<PathBuf> {

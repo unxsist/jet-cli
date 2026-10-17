@@ -21,9 +21,13 @@ Typical flow: get_status -> (set_delivery_address) -> search_restaurants -> get_
 get_menu_item (for sizes/options) -> add_to_basket -> view_basket -> checkout_preview -> \
 place_order -> order_status.
 
-Login: if a tool reports auth_required, ask the user for their email (or use the one from \
-get_status), call login_start, ask the user for the code they received by email, then call \
-login_complete. A small login window may appear on the user's screen for a few seconds.
+Login: if a tool reports auth_required, call login_start (with the user's email if known). \
+- status code_sent: ask the user for the code they received by email, then call login_complete \
+with it. A small login window may appear on the user's screen for a few seconds. \
+- status open_link (no screen here, e.g. a sandbox): give the user the url to open on their \
+phone or computer. After logging in they land on a plain text page; ask them to copy that \
+page's full address and pass it to login_complete. The address is safe to share: it only \
+works for this login.
 
 Ordering costs the user money. Before place_order, show the user the restaurant, items, \
 delivery address and the total from checkout_preview and get an explicit yes. Pass that total \
@@ -35,10 +39,10 @@ fn tools() -> Value {
     json!([
         { "name": "get_status", "description": "Login state, account, delivery address and the current basket.",
           "inputSchema": s(json!({}), &[]) },
-        { "name": "login_start", "description": "Start logging in: JET emails the user a login code. Then ask the user for the code and call login_complete.",
+        { "name": "login_start", "description": "Start logging in. Returns code_sent (ask the user for the emailed code) or open_link (give the user the url; they log in on their own device and send back the address of the page they end on).",
           "inputSchema": s(json!({ "email": { "type": "string", "description": "Defaults to the last email used." } }), &[]) },
-        { "name": "login_complete", "description": "Finish a login with the code from the user's email.",
-          "inputSchema": s(json!({ "code": { "type": "string" } }), &["code"]) },
+        { "name": "login_complete", "description": "Finish a login: the code from the user's email, or the full address of the page they ended on after an open_link login.",
+          "inputSchema": s(json!({ "code": { "type": "string", "description": "Emailed code, or the address after open_link." } }), &["code"]) },
         { "name": "set_delivery_address", "description": "Set the delivery address (street + number, postcode or city).",
           "inputSchema": s(json!({ "address": { "type": "string" } }), &["address"]) },
         { "name": "search_restaurants", "description": "Restaurants that deliver to the delivery address, open ones first.",
@@ -289,6 +293,11 @@ impl Server {
                 }))
             }
             "login_start" => {
+                // No screen here (sandbox, server): the user logs in on their own device.
+                if !crate::auth::webview::can_show_window() {
+                    let url = crate::auth::start_link(&ctx.paths, &ctx.api.tenant, false)?;
+                    return Ok(agent_login::link_reply(&url));
+                }
                 let email = agent_login::pick_email(&ctx.config, str_arg(args, "email"))?;
                 let opts = agent_login::login_options(&ctx.config, &email, false, false);
                 let mut session = LoginSession::start(
@@ -298,7 +307,14 @@ impl Server {
                     email.clone(),
                     opts,
                 );
-                match session.until_code_sent().await? {
+                let sent = match session.until_code_sent().await {
+                    Err(e) if e.is::<crate::auth::webview::Unavailable>() => {
+                        let url = crate::auth::start_link(&ctx.paths, &ctx.api.tenant, false)?;
+                        return Ok(agent_login::link_reply(&url));
+                    }
+                    other => other?,
+                };
+                match sent {
                     None => {
                         self.login = Some((session, email.clone()));
                         Ok(
@@ -318,6 +334,12 @@ impl Server {
             }
             "login_complete" => {
                 let code = str_arg(args, "code").context("code is required")?;
+                if code.contains("code=")
+                    || (self.login.is_none() && crate::auth::has_pending_link(&ctx.paths))
+                {
+                    let name = agent_login::finish_link(&mut ctx, &code).await?;
+                    return Ok(json!({ "status": "logged_in", "account": name }));
+                }
                 let (mut session, email) = self.login.take().ok_or_else(|| {
                     crate::errors::input_error("no login in progress; call login_start first")
                 })?;

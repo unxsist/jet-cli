@@ -67,7 +67,9 @@ pub fn record_success(
     if outcome.needed_window {
         config.login_window_until = Some(chrono::Utc::now().timestamp() + 7 * 24 * 3600);
     }
-    config.email = Some(email.to_string());
+    if !email.is_empty() {
+        config.email = Some(email.to_string());
+    }
     outcome.tokens.save(paths)?;
     config.save(paths)?;
     Ok(display_name(&outcome.tokens.claims()?))
@@ -82,8 +84,37 @@ fn report(json_out: bool, value: serde_json::Value, text: String) -> Result<()> 
     }
 }
 
+/// `jet login link`: a login link to open on any device.
+pub fn link(ctx: &mut Ctx, fresh: bool) -> Result<()> {
+    let url = crate::auth::start_link(&ctx.paths, &ctx.api.tenant, fresh)?;
+    show_link(ctx.json, &url)
+}
+
+fn show_link(json_out: bool, url: &str) -> Result<()> {
+    if json_out {
+        return ui::print_json(&link_reply(url));
+    }
+    crate::auth::print_link(url);
+    eprintln!("Then run: jet login code '<address>'");
+    Ok(())
+}
+
+pub fn link_reply(url: &str) -> serde_json::Value {
+    json!({
+        "status": "open_link",
+        "url": url,
+        "next": "The user opens url on their phone or computer and logs in. They end on a plain \
+                 text page (robots.txt); they copy that page's full address and give it back. \
+                 Finish with `jet login code '<address>'` (MCP: login_complete).",
+    })
+}
+
 /// `jet login start`: launches the background login and returns once the code was emailed.
+/// Without a screen (server, sandbox) it hands out a login link instead.
 pub async fn start(ctx: &mut Ctx, email: Option<String>, fresh: bool) -> Result<()> {
+    if !webview::can_show_window() {
+        return link(ctx, fresh);
+    }
     let email = pick_email(&ctx.config, email)?;
     // Only one login at a time.
     if let Some(p) = config::read_json::<Pending>(&pending_file(&ctx.paths))? {
@@ -136,6 +167,7 @@ pub async fn start(ctx: &mut Ctx, email: Option<String>, fresh: bool) -> Result<
                 reply["name"].as_str().unwrap_or_default()
             ),
         ),
+        Some("open_link") => show_link(ctx.json, reply["url"].as_str().unwrap_or_default()),
         _ => Err(anyhow!(
             "{}",
             reply["message"].as_str().unwrap_or("login failed")
@@ -143,9 +175,33 @@ pub async fn start(ctx: &mut Ctx, email: Option<String>, fresh: bool) -> Result<
     }
 }
 
-/// `jet login code <code>`: hands the code to the background login.
+/// Finishes a link login with the pasted address; returns the display name.
+pub async fn finish_link(ctx: &mut Ctx, pasted: &str) -> Result<String> {
+    let tokens = crate::auth::finish_link(&ctx.api.http, &ctx.paths, pasted).await?;
+    let outcome = LoginOutcome {
+        tokens,
+        needed_window: false,
+    };
+    let email = outcome.tokens.claims()?["email"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    record_success(&ctx.paths, &mut ctx.config, &email, &outcome)
+}
+
+/// `jet login code <code>`: hands the code to the background login, or finishes a link login
+/// with the pasted address.
 pub async fn submit(ctx: &mut Ctx, code: &str) -> Result<()> {
-    let pending: Pending = config::read_json(&pending_file(&ctx.paths))?
+    let pending: Option<Pending> = config::read_json(&pending_file(&ctx.paths))?;
+    if code.contains("code=") || (pending.is_none() && crate::auth::has_pending_link(&ctx.paths)) {
+        let name = ui::with_spinner("Logging in…", finish_link(ctx, code)).await?;
+        return report(
+            ctx.json,
+            json!({ "status": "logged_in", "name": name }),
+            format!("Logged in as {name}."),
+        );
+    }
+    let pending = pending
         .ok_or_else(|| errors::input_error("no login in progress; run `jet login start` first"))?;
     let url = format!("http://127.0.0.1:{}/{}/code", pending.port, pending.nonce);
     let resp = ui::with_spinner(
@@ -210,16 +266,13 @@ pub async fn daemon(ctx: Ctx, email: String, fresh: bool) -> Result<()> {
             say(json!({ "status": "logged_in", "name": name }));
             return Ok(());
         }
+        Err(e) if e.is::<webview::Unavailable>() => {
+            let url = crate::auth::start_link(&ctx.paths, &ctx.api.tenant, fresh)?;
+            say(json!({ "status": "open_link", "url": url }));
+            return Ok(());
+        }
         Err(e) => {
-            let unavailable = e.is::<webview::Unavailable>();
-            say(json!({
-                "status": "error",
-                "message": if unavailable {
-                    format!("{e:#}; run `jet login` in a terminal instead")
-                } else {
-                    format!("{e:#}")
-                },
-            }));
+            say(json!({ "status": "error", "message": format!("{e:#}") }));
             return Ok(());
         }
     }
@@ -280,4 +333,57 @@ async fn handle_code(
     };
     s.done.notify_one();
     Json(reply)
+}
+
+// ---- Moving a login between machines ----
+
+const SESSION_PREFIX: &str = "jet1.";
+
+/// `jet auth export`: this login as a portable string (the refresh token).
+pub async fn export(ctx: &mut Ctx) -> Result<()> {
+    ctx.api.require_token().await?;
+    let tokens = ctx.api.tokens().await.context("not logged in")?;
+    let body = json!({ "rt": tokens.refresh_token, "t": ctx.api.tenant.code });
+    let encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        body.to_string(),
+    );
+    let session = format!("{SESSION_PREFIX}{encoded}");
+    if ctx.json {
+        return ui::print_json(&json!({ "session": session }));
+    }
+    eprintln!("This logs in as you: keep it secret (e.g. as a sandbox's JET_SESSION secret).");
+    println!("{session}");
+    Ok(())
+}
+
+/// Tokens from a `jet auth export` string; they refresh on first use.
+pub fn tokens_from_session(s: &str) -> Result<crate::auth::Tokens> {
+    let raw = s
+        .trim()
+        .strip_prefix(SESSION_PREFIX)
+        .context("not a session string from `jet auth export`")?;
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, raw)
+        .context("damaged session string")?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).context("damaged session string")?;
+    let rt = v["rt"].as_str().context("damaged session string")?;
+    Ok(crate::auth::Tokens {
+        access_token: String::new(),
+        refresh_token: rt.to_string(),
+        expires_at: 0,
+        id_token: None,
+    })
+}
+
+/// `jet auth import <session>`.
+pub async fn import(ctx: &mut Ctx, session: &str) -> Result<()> {
+    let stale = tokens_from_session(session)?;
+    let fresh = crate::auth::refresh(&ctx.api.http, &ctx.api.tenant, &stale).await?;
+    fresh.save(&ctx.paths)?;
+    let name = display_name(&fresh.claims()?);
+    report(
+        ctx.json,
+        json!({ "status": "logged_in", "name": name }),
+        format!("Logged in as {name}."),
+    )
 }

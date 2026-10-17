@@ -12,8 +12,8 @@ use crate::menu::{self, Item, Menu};
 use crate::orders;
 use crate::ui::{self, bold, dim, euros, euros_cents};
 use crate::{
-    BasketAction, Command, LoginStep, OrderAction, OrderDetails, Sort, agent_login, checkout,
-    service,
+    AuthAction, BasketAction, Command, LoginStep, OrderAction, OrderDetails, Sort, agent_login,
+    checkout, service,
 };
 
 pub(crate) struct Ctx {
@@ -47,6 +47,7 @@ pub async fn run(command: Command, json: bool) -> Result<()> {
         } => match step {
             LoginStep::Start { email, fresh } => agent_login::start(&mut ctx, email, fresh).await,
             LoginStep::Code { code } => agent_login::submit(&mut ctx, &code).await,
+            LoginStep::Link { fresh } => agent_login::link(&mut ctx, fresh),
             LoginStep::Daemon { email, fresh } => agent_login::daemon(ctx, email, fresh).await,
         },
         Command::Login {
@@ -58,6 +59,12 @@ pub async fn run(command: Command, json: bool) -> Result<()> {
         } => login(&mut ctx, email, manual, fresh, show_browser).await,
         Command::Logout { forget_browser } => logout(&ctx, forget_browser),
         Command::Whoami => whoami(&ctx).await,
+        Command::Auth {
+            action: AuthAction::Export,
+        } => agent_login::export(&mut ctx).await,
+        Command::Auth {
+            action: AuthAction::Import { session },
+        } => agent_login::import(&mut ctx, &session).await,
         Command::Address { query } => address(&mut ctx, &query.join(" ")).await,
         Command::Restaurants {
             query,
@@ -138,7 +145,8 @@ async fn login(
     show_browser: bool,
 ) -> Result<()> {
     let tenant = ctx.api.tenant.clone();
-    if manual {
+    // No screen here (server, sandbox): log in on another device via a link.
+    if manual || !webview::can_show_window() {
         let tokens = auth::login_manual(&ctx.api.http, &tenant, fresh).await?;
         return finish_login(ctx, tokens);
     }

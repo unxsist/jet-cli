@@ -56,6 +56,11 @@ pub enum Command {
     },
     /// Show the logged-in account.
     Whoami,
+    /// Move a login to another machine (e.g. an agent's sandbox).
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Show or set the delivery address, e.g. `jet address "Damrak 1, Amsterdam"`.
     Address {
         /// Address or postcode + house number.
@@ -171,8 +176,16 @@ pub enum LoginStep {
         #[arg(long)]
         fresh: bool,
     },
-    /// Finish a login started with `jet login start`.
+    /// Finish a login: the emailed code (after `start`), or the address of the page you ended on
+    /// (after `link`).
     Code { code: String },
+    /// Log in on another device (phone, laptop): prints a link; afterwards pass the address of the
+    /// page you end on to `jet login code`. For servers and sandboxes without a screen.
+    Link {
+        /// Ignore any remembered session and log in again.
+        #[arg(long)]
+        fresh: bool,
+    },
     /// Internal: the background half of `jet login start`.
     #[command(hide = true)]
     Daemon {
@@ -203,6 +216,15 @@ pub struct OrderDetails {
 pub enum OrderAction {
     /// Has the last order been paid and placed?
     Status,
+}
+
+#[derive(Subcommand)]
+pub enum AuthAction {
+    /// Print this login as a string for `jet auth import` or the JET_SESSION environment variable.
+    /// Treat it like a password.
+    Export,
+    /// Log in with a string from `jet auth export`.
+    Import { session: String },
 }
 
 #[derive(Subcommand)]

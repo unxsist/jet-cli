@@ -68,7 +68,19 @@ or in any MCP client config:
 ```
 
 When the agent needs you to log in, it asks for your email, triggers the code email and asks you for
-the code. Agents that use the shell instead can run every command with `--json` and use
+the code.
+
+### Agents in a cloud sandbox (no screen)
+
+JET's login page needs a real browser, so in a sandbox (Daytona, CI, a server) there are two ways:
+
+- **Log in on your own device.** `login_start` / `jet login start` (or `jet login link`) returns a
+  link. Open it on your phone or computer and log in; you end on a plain text page. Copy that page's
+  address and give it to the agent (`login_complete` / `jet login code '<address>'`). The address is
+  safe to share: it only works together with a secret that never leaves the sandbox.
+- **Bring an existing login.** Run `jet auth export` where you're logged in and store the output as
+  the sandbox's `JET_SESSION` secret (or run `jet auth import <string>` there). Treat it like a
+  password; `jet logout` on the sandbox doesn't revoke it. Agents that use the shell instead can run every command with `--json` and use
 `jet login start --email …` / `jet login code <code>`; errors come back as JSON with exit code 2
 (log in first) or 3 (needs more input).
 

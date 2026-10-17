@@ -58,7 +58,14 @@ pub fn http_client() -> Result<reqwest::Client> {
 
 impl Api {
     pub fn new(paths: Paths, tenant: Tenant) -> Result<Self> {
-        let tokens = Tokens::load(&paths)?;
+        let mut tokens = Tokens::load(&paths)?;
+        // Sandboxes/CI: a login from `jet auth export` in JET_SESSION, refreshed on first use.
+        if tokens.is_none()
+            && let Ok(session) = std::env::var("JET_SESSION")
+            && !session.trim().is_empty()
+        {
+            tokens = Some(crate::agent_login::tokens_from_session(&session)?);
+        }
         Ok(Self {
             http: http_client()?,
             tenant,
