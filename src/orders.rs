@@ -31,6 +31,17 @@ pub struct Order {
     pub restaurant: OrderRestaurant,
     #[serde(default, deserialize_with = "nullable")]
     pub status: Option<Status>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub consumer: Option<Consumer>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Consumer {
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub contact_number: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +56,8 @@ pub struct Information {
 #[serde(rename_all = "camelCase")]
 pub struct OrderBasket {
     pub total: f64,
+    #[serde(default, deserialize_with = "nullable")]
+    pub basket_id: String,
     pub summary: OrderSummary,
 }
 

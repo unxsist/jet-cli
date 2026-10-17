@@ -131,6 +131,27 @@ pub enum Command {
     },
     /// Run as an MCP server on stdio, for AI agents (e.g. `claude mcp add jet -- jet mcp`).
     Mcp,
+    /// Get the basket ready to order: shows address, time, total and payment methods.
+    Checkout {
+        #[command(flatten)]
+        details: OrderDetails,
+    },
+    /// Place the order; prints a payment link (and QR code) to finish paying.
+    Order {
+        #[command(subcommand)]
+        action: Option<OrderAction>,
+        /// Payment method: ideal, creditcard, paypal_rest, … (see `jet checkout`).
+        #[arg(long)]
+        pay: Option<String>,
+        /// Order without asking, if the total is exactly this amount (for scripts/agents).
+        #[arg(long)]
+        confirm_total: Option<f64>,
+        /// Open the payment page in your browser.
+        #[arg(long)]
+        open: bool,
+        #[command(flatten)]
+        details: OrderDetails,
+    },
     /// Show or change the basket.
     #[command(alias = "b")]
     Basket {
@@ -160,6 +181,28 @@ pub enum LoginStep {
         #[arg(long)]
         fresh: bool,
     },
+}
+
+#[derive(clap::Args)]
+pub struct OrderDetails {
+    /// Delivery time: "asap" or e.g. "19:30" (first slot from then).
+    #[arg(long)]
+    pub time: Option<String>,
+    /// Note for the courier (delivery) or restaurant (pickup).
+    #[arg(long)]
+    pub note: Option<String>,
+    /// Your name for the order (remembered; default: from your last order).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Your phone number for the order (remembered; default: from your last order).
+    #[arg(long)]
+    pub phone: Option<String>,
+}
+
+#[derive(Subcommand)]
+pub enum OrderAction {
+    /// Has the last order been paid and placed?
+    Status,
 }
 
 #[derive(Subcommand)]

@@ -44,6 +44,19 @@ pub struct Location {
     pub postcode: String,
     pub latitude: f64,
     pub longitude: f64,
+    /// "Street 12"; empty for locations saved by older versions.
+    #[serde(default)]
+    pub street: String,
+    #[serde(default)]
+    pub city: String,
+}
+
+/// Name and phone number for orders (the restaurant/courier contact).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Contact {
+    pub first_name: String,
+    pub last_name: String,
+    pub phone: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +71,7 @@ pub struct Config {
     /// Until when (unix time) `jet login` starts with a visible window, because the security check
     /// didn't pass in a hidden browser last time.
     pub login_window_until: Option<i64>,
+    pub contact: Option<Contact>,
 }
 
 impl Default for Config {
@@ -68,6 +82,7 @@ impl Default for Config {
             browser: None,
             location: None,
             login_window_until: None,
+            contact: None,
         }
     }
 }
@@ -99,6 +114,9 @@ impl Paths {
     }
     pub fn last_list_file(&self) -> PathBuf {
         self.config_dir.join("last-restaurants.json")
+    }
+    pub fn pending_order_file(&self) -> PathBuf {
+        self.config_dir.join("pending-order.json")
     }
     pub fn last_orders_file(&self) -> PathBuf {
         self.config_dir.join("last-orders.json")

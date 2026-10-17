@@ -19,7 +19,14 @@ jet basket                            # show; also: rm <n>, qty <n> <q>, clear
 jet login                             # email + code
 jet orders                            # your recent orders
 jet reorder 2                         # put order 2 back in the basket
+jet checkout                          # address, time, total, payment methods
+jet order --pay ideal                 # confirm, then pay via the link / QR code
+jet order status                      # paid and placed yet?
 ```
+
+`jet order` asks for confirmation and prints a payment link (iDEAL, card or PayPal) plus a QR code
+for your phone. Nothing is ordered until you've paid. Name and phone number for the order come from
+your last order (or `--name`/`--phone`); `--time 19:30` schedules it, `--note` adds a courier note.
 
 Anything you leave out (restaurant, item, size, options) is asked for interactively. Every command
 accepts `--json` for scripting.
@@ -65,7 +72,9 @@ the code. Agents that use the shell instead can run every command with `--json` 
 `jet login start --email …` / `jet login code <code>`; errors come back as JSON with exit code 2
 (log in first) or 3 (needs more input).
 
-Checkout and payment are not available yet (`checkout_preview`/`place_order` say so).
+Ordering: `checkout_preview` shows the total; `place_order` needs the payment method and the exact
+total the user confirmed (`--confirm-total` on the CLI), and returns a payment link for the user to
+pay. The order only goes to the restaurant once the user has paid; `order_status` tells.
 
 ## Releases
 

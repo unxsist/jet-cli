@@ -50,11 +50,10 @@ pub async fn geocode(api: &Api, query: &str) -> Result<Location> {
         .trim()
         .to_string();
     let postcode = a.postcode.unwrap_or_default();
+    let city = a.city.unwrap_or_default();
     let label = [
-        street,
-        format!("{postcode} {}", a.city.unwrap_or_default())
-            .trim()
-            .to_string(),
+        street.clone(),
+        format!("{postcode} {city}").trim().to_string(),
     ]
     .into_iter()
     .filter(|s| !s.is_empty())
@@ -65,5 +64,7 @@ pub async fn geocode(api: &Api, query: &str) -> Result<Location> {
         postcode,
         latitude: f.geometry.coordinates[1],
         longitude: f.geometry.coordinates[0],
+        street,
+        city,
     })
 }

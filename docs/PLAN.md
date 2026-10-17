@@ -17,8 +17,8 @@ Rust CLI for ordering on Just Eat Takeaway (NL / thuisbezorgd.nl first; tenant k
   - Tokens are stored in `~/.config/jet-cli/` (0600) and refreshed silently.
 - **Payment (later):** iDEAL (print link + terminal QR), saved card / PayPal (one-click if the API allows),
   gift card / credit.
-- **Scope now:** read-only. No checkout or order placement until explicitly approved; any order command will
-  always require explicit confirmation showing the total.
+- **Ordering:** always requires explicit confirmation of the total (prompt, or `--confirm-total` /
+  `expected_total` for agents). Payment happens on JET's payment page via a link, so the user always pays.
 
 ## Milestones
 
@@ -31,4 +31,5 @@ Rust CLI for ordering on Just Eat Takeaway (NL / thuisbezorgd.nl first; tenant k
 7. ✅ `jet orders` (history) and `jet reorder` (rebuilt from today's menu; JET's own reorder endpoint is
    gated by `canReorder`).
 8. ✅ Private GitHub repo + Actions: cross-platform builds, releases on `v*` tags.
-9. *(Later, gated)* checkout + payment.
+9. ✅ Checkout + payment: auto-filled checkout, payment link (iDEAL/card/PayPal) + QR, `jet order status`.
+10. ✅ Agents: `jet mcp`, `jet login start`/`code`, JSON errors with exit codes.

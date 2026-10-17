@@ -11,7 +11,10 @@ use crate::errors::needs_input;
 use crate::menu::{self, Item, Menu};
 use crate::orders;
 use crate::ui::{self, bold, dim, euros, euros_cents};
-use crate::{BasketAction, Command, LoginStep, Sort, agent_login, service};
+use crate::{
+    BasketAction, Command, LoginStep, OrderAction, OrderDetails, Sort, agent_login, checkout,
+    service,
+};
 
 pub(crate) struct Ctx {
     pub(crate) paths: Paths,
@@ -107,6 +110,18 @@ pub async fn run(command: Command, json: bool) -> Result<()> {
         Command::Orders { limit } => orders(&mut ctx, limit).await,
         Command::Reorder { number, new } => reorder(&mut ctx, number, new).await,
         Command::Mcp => unreachable!("handled in main"),
+        Command::Checkout { details } => checkout_cmd(&mut ctx, details).await,
+        Command::Order {
+            action: Some(OrderAction::Status),
+            ..
+        } => order_status(&mut ctx).await,
+        Command::Order {
+            action: None,
+            pay,
+            confirm_total,
+            open,
+            details,
+        } => order(&mut ctx, pay, confirm_total, open, details).await,
         Command::Basket { action } => {
             basket_cmd(&mut ctx, action.unwrap_or(crate::BasketAction::Show)).await
         }
@@ -1167,6 +1182,242 @@ fn print_basket(ctx: &Ctx, b: &Basket, restaurant: &str) -> Result<()> {
             euros(sm.to_spend),
             euros(sm.minimum_order_amount)
         ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- checkout
+
+fn prepare_opts(d: OrderDetails) -> Result<checkout::Prepare> {
+    let contact = match (d.name, d.phone) {
+        (None, None) => None,
+        (Some(name), Some(phone)) => {
+            let (first, last) = name.trim().split_once(' ').unwrap_or((name.trim(), ""));
+            Some(config::Contact {
+                first_name: first.into(),
+                last_name: last.into(),
+                phone,
+            })
+        }
+        _ => needs_input!("pass both --name and --phone"),
+    };
+    Ok(checkout::Prepare {
+        time: d.time,
+        note: d.note,
+        contact,
+    })
+}
+
+fn print_checkout(summary: &serde_json::Value) {
+    let w = ui::width().min(64);
+    let money = |v: &serde_json::Value| euros(v.as_f64().unwrap_or_default());
+    println!(
+        "{}",
+        bold(summary["restaurant"].as_str().unwrap_or_default())
+    );
+    println!();
+    for it in summary["items"].as_array().into_iter().flatten() {
+        let left = format!(
+            "{}× {}",
+            it["quantity"],
+            it["name"].as_str().unwrap_or_default()
+        );
+        println!("{}", ui::spread(&left, &money(&it["price"]), w));
+    }
+    println!("{}", dim(&"─".repeat(w)));
+    for c in summary["costs"].as_array().into_iter().flatten() {
+        println!(
+            "{}",
+            ui::spread(
+                c["name"].as_str().unwrap_or_default(),
+                &money(&c["amount"]),
+                w
+            )
+        );
+    }
+    println!(
+        "{}",
+        bold(&ui::spread("Total", &money(&summary["total"]), w))
+    );
+    println!();
+    if let Some(a) = summary["delivery_address"].as_str() {
+        println!("Deliver to  {a}");
+    }
+    println!(
+        "Time        {}",
+        summary["time"].as_str().unwrap_or_default()
+    );
+    let methods: Vec<&str> = summary["payment_methods"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    println!("Payment     {}", methods.join(", "));
+    for p in summary["problems"].as_array().into_iter().flatten() {
+        eprintln!(
+            "{} {}",
+            console::style("!").yellow().bold(),
+            p.as_str().unwrap_or_default()
+        );
+    }
+}
+
+async fn checkout_cmd(ctx: &mut Ctx, d: OrderDetails) -> Result<()> {
+    let opts = prepare_opts(d)?;
+    let (current, co) =
+        ui::with_spinner("Preparing checkout…", checkout::prepare(ctx, opts)).await?;
+    let methods = checkout::payment_methods(&ctx.api, &co, &current.basket_id).await?;
+    let summary = checkout::summary(&co, &methods);
+    if ctx.json {
+        return ui::print_json(&summary);
+    }
+    print_checkout(&summary);
+    if co.is_fulfillable {
+        ui::hint(&format!(
+            "\nOrder with: jet order --pay {}",
+            methods.first().map_or("ideal", |m| m.payment_type.as_str())
+        ));
+    }
+    Ok(())
+}
+
+async fn order(
+    ctx: &mut Ctx,
+    pay: Option<String>,
+    confirm_total: Option<f64>,
+    open: bool,
+    d: OrderDetails,
+) -> Result<()> {
+    let opts = prepare_opts(d)?;
+    // Show what's being ordered first; the confirmation covers exactly this total.
+    let (current, co) = ui::with_spinner(
+        "Preparing checkout…",
+        checkout::prepare(
+            ctx,
+            checkout::Prepare {
+                time: opts.time.clone(),
+                note: opts.note.clone(),
+                contact: opts.contact.clone(),
+            },
+        ),
+    )
+    .await?;
+    let methods = checkout::payment_methods(&ctx.api, &co, &current.basket_id).await?;
+    let summary = checkout::summary(&co, &methods);
+    let problems = checkout::problems(&co);
+    if !problems.is_empty() {
+        if !ctx.json {
+            print_checkout(&summary);
+        }
+        bail!("can't order yet: {}", problems.join("; "));
+    }
+    let total = co.purchase.total.price.amount as f64 / 100.0;
+    let method = match pay {
+        Some(m) => m,
+        None if ui::interactive() && !methods.is_empty() => {
+            let labels: Vec<String> = methods.iter().map(|m| m.display_name.clone()).collect();
+            let i = Select::new()
+                .with_prompt("Pay with")
+                .items(ui::picker_labels(labels))
+                .default(0)
+                .interact()?;
+            methods[i].payment_type.clone()
+        }
+        None => needs_input!(
+            "choose a payment method with --pay ({})",
+            methods
+                .iter()
+                .map(|m| m.payment_type.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let expected = match confirm_total {
+        Some(t) => t,
+        None if ui::interactive() => {
+            print_checkout(&summary);
+            println!();
+            let ok = Confirm::new()
+                .with_prompt(format!("Order for {} and pay with {method}?", euros(total)))
+                .default(false)
+                .interact()?;
+            if !ok {
+                bail!("cancelled");
+            }
+            total
+        }
+        None => needs_input!(
+            "confirm the order by passing --confirm-total {total:.2} (the total the user agreed to)"
+        ),
+    };
+    let (pending, outcome) = ui::with_spinner(
+        "Placing order…",
+        checkout::place(ctx, &method, expected, opts),
+    )
+    .await?;
+    match outcome {
+        checkout::PayOutcome::PaymentPage { url, status_url } => {
+            if ctx.json {
+                return ui::print_json(&serde_json::json!({
+                    "status": "awaiting_payment",
+                    "payment_url": url,
+                    "status_url": status_url,
+                    "total": pending.total_cents as f64 / 100.0,
+                }));
+            }
+            println!(
+                "Pay {} to send the order to {}:",
+                euros(total),
+                pending.restaurant
+            );
+            println!("\n  {url}\n");
+            if let Ok(code) = qrcode::QrCode::new(url.as_bytes()) {
+                let qr = code
+                    .render::<qrcode::render::unicode::Dense1x2>()
+                    .quiet_zone(true)
+                    .build();
+                println!("{qr}");
+            }
+            if open {
+                let _ = open::that_detached(&url);
+            }
+            ui::hint(
+                "Scan the code with your phone or open the link. Nothing is ordered until you've paid. Then: jet order status",
+            );
+        }
+        checkout::PayOutcome::Placed { order_id } => {
+            if ctx.json {
+                return ui::print_json(
+                    &serde_json::json!({ "status": "placed", "order_id": order_id }),
+                );
+            }
+            println!("Order placed at {}.", pending.restaurant);
+        }
+    }
+    Ok(())
+}
+
+async fn order_status(ctx: &mut Ctx) -> Result<()> {
+    let status = ui::with_spinner("Checking…", checkout::status(ctx)).await?;
+    if ctx.json {
+        return ui::print_json(&status);
+    }
+    match status["status"].as_str() {
+        Some("placed") => println!(
+            "Order {} at {} is placed ({}).",
+            status["order"].as_str().unwrap_or_default(),
+            status["restaurant"].as_str().unwrap_or_default(),
+            status["order_status"].as_str().unwrap_or("in progress")
+        ),
+        _ => {
+            println!(
+                "Waiting for payment of {} at {}.",
+                euros(status["total"].as_f64().unwrap_or_default()),
+                status["restaurant"].as_str().unwrap_or_default()
+            );
+            println!("  {}", status["payment_url"].as_str().unwrap_or_default());
+        }
     }
     Ok(())
 }

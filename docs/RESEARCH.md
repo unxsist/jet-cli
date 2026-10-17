@@ -88,9 +88,26 @@ github.com/d-kold/bakasur — superseded.
   - remove `PUT` `{basketId, product:{removed:[{date, basketProductId, modifierGroups, dealGroups:[]}]}}`
   - `GET /basket/{id}`. Response is PascalCase: `BasketSummary.Products[].BasketProductIds`, `BasketTotals`,
     `Adjustments` (service fee), `DeliveryCharge`, `Prompts.SpendMore`.
-- Checkout: `GET/PATCH /checkout/{t}/{basketId}`, `/checkout/{t}/{id}/fulfilment/availabletimes`, `/payments`
-- Payment: `GET /payment/{t}/partners/{partnerId}/options?serviceType=&checkoutId=`,
-  `POST /payment/{t}/authorize {paymentMethod, identifier, paymentToken, additionalData}`;
-  saved methods `/payment/{t}/options/{method}/savedpaymenttypes/{id}`. Checkout sends an Incognia device
-  token header — may block fully headless checkout; to verify later.
+- Checkout (Bearer token; checkout id = basket id):
+  - `GET /checkout/{t}/{basketId}` → `purchase` (groups/products, `lineItems`, `total.price.amount` in cents),
+    `customer`, `fulfilment.time` / `.location`, `isFulfillable`, `issues[].code` (e.g. `FIRST_NAME_REQUIRED`,
+    `PHONE_NUMBER_REQUIRED`, `FULFILMENT_TIME_REQUIRED`/`_UNAVAILABLE`, `ADDRESS_LINES_REQUIRED`,
+    `LOCALITY_REQUIRED`, `POSTAL_CODE_REQUIRED`, `GEOLOCATION_REQUIRED`).
+  - `PATCH` same URL, `Content-Type: application/json-patch+json`, ops `{op:"add", path, value}`:
+    `/customer` `{firstName, lastName, phoneNumber}`, `/fulfilment/time` `{asap, scheduled: {from, to} | null}`,
+    `/fulfilment/location` `{address: {lines, locality, administrativeArea, postalCode}, geolocation: {latitude, longitude}}`,
+    `/notes/courier|kitchen|order` `{note}`, `/voucher` `{code}`, tipping, consents. Returns the checkout.
+  - `GET …/fulfilment/availabletimes` → `times[{from, to}]` (UTC); ASAP gives `FULFILMENT_TIME_UNAVAILABLE`
+    when the restaurant isn't open yet, then schedule a slot.
+  - `GET …/options` → tipping, which notes are accepted, vouchers.
+- Payment methods: `GET /payment/{t}/partners/{restaurantId}/options?serviceType=&checkoutId={basketId}` →
+  `availablePaymentTypes[{paymentType, displayName, behaviour: external|native, status}]`, `savedPaymentTypes`.
+  `external` (ideal, creditcard, paypal_rest) end on a payment page; `native` (applepay, googlepay) need an SDK.
+- Pay: `POST /checkout/{t}/{basketId}/payments` with headers `x-jet-application-id: 16`,
+  `x-jet-application-version`, body `{currency, total (cents), methods: [{type, amount, fee}], returnUrl}`.
+  → 201 `{id, status: {code: "awaitingAction", redirect: {url (e.g. pay.ideal.nl), pollingPageUrl
+  (pay.thuisbezorgd.nl/nl/status/…)}}}`; `accepted` (+orderId) for methods without a payment step; `rejected`
+  reasons include `totalsDoNotMatch`, `duplicate`, `paymentRefused`. Until paid there is **no order**
+  (`GET /consumer/me/orders/{t}/{id}` → 404); once paid it shows up in the order list with
+  `basket.basketId` = the basket id. Tested 2026-10-17 with iDEAL (left unpaid).
 - Orders: `/consumer/me/orders/{t}`, reorder `/consumer/me/orders/{t}/{id}/newbasket`

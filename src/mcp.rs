@@ -19,7 +19,7 @@ Order food from Just Eat Takeaway (thuisbezorgd.nl) for the user.
 
 Typical flow: get_status -> (set_delivery_address) -> search_restaurants -> get_menu -> \
 get_menu_item (for sizes/options) -> add_to_basket -> view_basket -> checkout_preview -> \
-place_order.
+place_order -> order_status.
 
 Login: if a tool reports auth_required, ask the user for their email (or use the one from \
 get_status), call login_start, ask the user for the code they received by email, then call \
@@ -27,8 +27,8 @@ login_complete. A small login window may appear on the user's screen for a few s
 
 Ordering costs the user money. Before place_order, show the user the restaurant, items, \
 delivery address and the total from checkout_preview and get an explicit yes. Pass that total \
-as expected_total. For online payment, place_order returns a payment_url: give it to the user \
-to pay; the order goes to the restaurant once they've paid.";
+as expected_total. place_order returns a payment_url: give it to the user to pay; the order only \
+goes to the restaurant once they've paid (check with order_status).";
 
 fn tools() -> Value {
     let s = |props: Value, required: &[&str]| json!({ "type": "object", "properties": props, "required": required });
@@ -89,7 +89,9 @@ fn tools() -> Value {
               "payment_method": { "type": "string", "description": "A method id from checkout_preview, e.g. 'ideal', 'creditcard', 'paypal_rest', 'cash'." },
               "expected_total": { "type": "number", "description": "The total (EUR) the user confirmed; the order is refused if it differs." },
               "note": { "type": "string", "description": "Note for the restaurant/courier." }
-          }), &["payment_method", "expected_total"]) }
+          }), &["payment_method", "expected_total"]) },
+        { "name": "order_status", "description": "Whether the last placed order has been paid and reached the restaurant, or is still waiting for payment.",
+          "inputSchema": s(json!({}), &[]) }
     ])
 }
 
@@ -461,6 +463,7 @@ impl Server {
                     .context("expected_total is required")?;
                 checkout::place_json(&mut ctx, &method, expected, str_arg(args, "note")).await
             }
+            "order_status" => checkout::status(&mut ctx).await,
             other => Err(anyhow!("unknown tool {other}")),
         }
     }
