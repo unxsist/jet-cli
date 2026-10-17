@@ -26,9 +26,27 @@ jobs:
       - run: cargo clippy --locked -- -D warnings
       - run: cargo test --locked
 
+  # On tags: a draft release that the build jobs attach their binaries to. Release assets don't
+  # count against the (account-wide) Actions artifact storage quota.
+  create-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --title "$GITHUB_REF_NAME" --generate-notes
+
   build:
     name: build (${{ matrix.target }})
+    needs: [check, create-release]
+    # Runs on every push; create-release is skipped unless this is a tag.
+    if: ${{ !cancelled() && needs.check.result == 'success' && needs.create-release.result != 'failure' }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -65,26 +83,26 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/jet.exe", README.md $name
           Compress-Archive -Path $name -DestinationPath "dist/$name.zip"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: jet-${{ matrix.target }}
-          path: dist/*
-          if-no-files-found: error
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
 
-  release:
+  publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, build]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Checksums
-        run: cd dist && sha256sum * > SHA256SUMS
-      - name: Create release
+      - name: Checksums and publish
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          mkdir dist && cd dist
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+          sha256sum * > SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

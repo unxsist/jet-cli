@@ -5,7 +5,7 @@ Order food from Just Eat Takeaway ([thuisbezorgd.nl](https://www.thuisbezorgd.nl
 Unofficial; it talks to the same APIs as the website, so things may break when they change.
 
 Download a binary for Linux, macOS or Windows from the
-[releases](../../releases) (or the latest CI run's artifacts), or build it yourself:
+[releases](../../releases), or build it yourself:
 
 ```sh
 cargo install --path .
@@ -42,8 +42,8 @@ See [docs/RESEARCH.md](docs/RESEARCH.md) for the API notes.
 
 ## Releases
 
-CI builds Linux (x86_64, arm64), macOS (Apple Silicon, Intel) and Windows (x86_64) binaries on every
-push. Pushing a `v*` tag publishes them as a GitHub release:
+CI builds Linux (x86_64, arm64), macOS (Apple Silicon, Intel) and Windows (x86_64) on every push.
+Pushing a `v*` tag attaches the binaries (and `SHA256SUMS`) to a GitHub release:
 
 ```sh
 git tag v0.1.0 && git push origin v0.1.0
