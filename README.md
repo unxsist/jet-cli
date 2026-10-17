@@ -44,6 +44,29 @@ Files: `~/.config/jet-cli/` (config, tokens, current basket, mode 0600) and
 
 See [docs/RESEARCH.md](docs/RESEARCH.md) for the API notes.
 
+## Use with AI agents
+
+`jet mcp` runs an [MCP](https://modelcontextprotocol.io) server on stdio with tools for login,
+delivery address, restaurant search, menus, basket, orders and reorder. Register it with your agent,
+e.g. Claude Code:
+
+```sh
+claude mcp add jet -- jet mcp
+```
+
+or in any MCP client config:
+
+```json
+{ "mcpServers": { "jet": { "command": "jet", "args": ["mcp"] } } }
+```
+
+When the agent needs you to log in, it asks for your email, triggers the code email and asks you for
+the code. Agents that use the shell instead can run every command with `--json` and use
+`jet login start --email …` / `jet login code <code>`; errors come back as JSON with exit code 2
+(log in first) or 3 (needs more input).
+
+Checkout and payment are not available yet (`checkout_preview`/`place_order` say so).
+
 ## Releases
 
 CI builds Linux (x86_64, arm64), macOS (Apple Silicon, Intel) and Windows (x86_64) on every push.
