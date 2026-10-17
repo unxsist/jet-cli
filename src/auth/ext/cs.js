@@ -66,7 +66,7 @@
 
     if (location.pathname !== lastPath) {
       lastPath = location.pathname;
-      send('page', lastPath);
+      send('page', location.href);
     }
 
     const email = document.querySelector('input[name=email]');

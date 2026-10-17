@@ -45,6 +45,9 @@ enum Msg {
 
 struct Shared {
     email: String,
+    /// Where the local start page sends the browser next (the authorize URL, or the code page
+    /// when a hidden browser takes over from the window).
+    next_url: Mutex<String>,
     otp: Mutex<(u64, String)>,
     tx: mpsc::UnboundedSender<Msg>,
 }
@@ -125,17 +128,22 @@ fn html_attr(s: &str) -> String {
         .replace('<', "&lt;")
 }
 
-async fn serve(shared: Arc<Shared>, nonce: &str, auth_url: &str) -> Result<u16> {
+async fn serve(shared: Arc<Shared>, nonce: &str) -> Result<u16> {
     let p = |s: &str| format!("/{nonce}{s}");
-    // The extension reads jet-cli's address from this page's URL, then continues to `auth_url`.
-    let start = format!(
-        "<!doctype html><meta charset=utf-8><title>jet-cli login</title>\
-         <body data-auth-url=\"{}\" style=\"font:16px system-ui;display:grid;place-items:center;height:90vh\">\
-         <p>Starting login…</p>",
-        html_attr(auth_url)
-    );
     let app = Router::new()
-        .route(&p("/start"), get(move || async move { Html(start) }))
+        // The extension reads jet-cli's address from this page's URL, then continues to next_url.
+        .route(
+            &p("/start"),
+            get(|State(s): State<Arc<Shared>>| async move {
+                let next = s.next_url.lock().unwrap().clone();
+                Html(format!(
+                    "<!doctype html><meta charset=utf-8><title>jet-cli login</title>\
+                     <body data-auth-url=\"{}\" style=\"font:16px system-ui;display:grid;place-items:center;height:90vh\">\
+                     <p>Starting login…</p>",
+                    html_attr(&next)
+                ))
+            }),
+        )
         .route(&p("/config"), get(|State(s): State<Arc<Shared>>| async move { Json(json!({ "email": s.email })) }))
         .route(
             &p("/otp"),
@@ -221,8 +229,7 @@ fn launch(
     .arg(format!("--app={url}"));
     if headless {
         cmd.arg("--headless=new");
-    }
-    if cfg!(target_os = "linux") {
+    } else if cfg!(target_os = "linux") {
         // The "auto" hint relies on XDG_SESSION_TYPE, which isn't always exported.
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             cmd.arg("--ozone-platform=wayland");
@@ -230,12 +237,19 @@ fn launch(
             cmd.arg("--ozone-platform-hint=auto");
         }
     }
+    // Distro launchers (e.g. Arch's) add flags from $XDG_CONFIG_HOME/chromium-flags.conf to every
+    // launch; personal flags there (Wayland, extra extensions) break the headless login.
+    cmd.env("XDG_CONFIG_HOME", paths.data_dir.join("browser-config"));
     let stderr = match std::env::var_os("JET_DEBUG") {
         Some(_) => {
             let log = paths.data_dir.join("browser.log");
             eprintln!("[debug] browser log: {}", log.display());
             cmd.arg("--enable-logging=stderr");
-            std::process::Stdio::from(std::fs::File::create(log)?)
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)?;
+            std::process::Stdio::from(file)
         }
         None => std::process::Stdio::null(),
     };
@@ -323,7 +337,22 @@ async fn close(mut child: Child) {
 }
 
 /// How long the hidden browser may wait for the security check before we show it to the user.
-const HEADLESS_CHECK_TIMEOUT: Duration = Duration::from_secs(12);
+const HEADLESS_CHECK_TIMEOUT: Duration = Duration::from_secs(8);
+
+pub struct LoginOptions {
+    pub force_login: bool,
+    /// Keep the window visible for the whole login (`--show-browser`).
+    pub show_window: bool,
+    /// Start with the window for the security check (it needed one last time), still hiding it
+    /// for the code step.
+    pub start_visible: bool,
+}
+
+pub struct LoginOutcome {
+    pub tokens: Tokens,
+    /// The security check didn't pass in the hidden browser.
+    pub needed_window: bool,
+}
 
 pub async fn login(
     http: &reqwest::Client,
@@ -331,25 +360,31 @@ pub async fn login(
     tenant: &Tenant,
     browser: &Path,
     email: &str,
-    force_login: bool,
-    show_window: bool,
-) -> Result<Tokens> {
+    opts: LoginOptions,
+) -> Result<LoginOutcome> {
+    let LoginOptions {
+        force_login,
+        show_window,
+        start_visible,
+    } = opts;
     let req = LoginRequest::new(tenant, force_login);
     let nonce = super::random_token(18);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let shared = Arc::new(Shared {
         email: email.to_string(),
+        next_url: Mutex::new(req.url.clone()),
         otp: Mutex::new((0, String::new())),
         tx: tx.clone(),
     });
-    let port = serve(shared.clone(), &nonce, &req.url).await?;
+    let port = serve(shared.clone(), &nonce).await?;
     std::fs::create_dir_all(&paths.data_dir)?;
     let extension = write_extension(&paths.data_dir, tenant)?;
 
     close_stale_window(&paths.browser_profile()).await;
     let start_url = format!("http://127.0.0.1:{port}/{nonce}/start");
     // The browser runs hidden; it's only shown if the security check needs a human.
-    let mut headless = !show_window;
+    let mut headless = !show_window && !start_visible;
+    let mut needed_window = false;
     let mut child = launch(browser, paths, &extension, &start_url, headless)?;
     let mut status = ui::Status::new("Connecting…");
 
@@ -363,9 +398,15 @@ pub async fn login(
     let mut told_turnstile = false;
     // Set once the server accepted the code; the page then needs a few seconds to redirect.
     let mut code_accepted = false;
+    let mut prompted = false;
+    // The security check only guards the email step. If the window had to be shown for it, a
+    // hidden browser takes over on the code page so the window is only up for a few seconds.
+    let mut code_page: Option<String> = None;
+    let mut handed_off = false;
 
     let result: Result<String> = loop {
         let mut show_reason: Option<&str> = None;
+        let mut hide = false;
         tokio::select! {
             _ = &mut deadline => break Err(anyhow::anyhow!("login timed out")),
             _ = terminated() => break Err(anyhow::anyhow!("login cancelled")),
@@ -406,6 +447,12 @@ pub async fn login(
                                 ));
                             }
                         }
+                        "page" if detail.contains("/mfa") => code_page = Some(detail.clone()),
+                        "page" if detail.contains("/login") && handed_off && headless => {
+                            // The hidden browser lost the session; finish in the window.
+                            show_reason = Some("Couldn't continue in the background; finishing in the login window.");
+                            *shared.next_url.lock().unwrap() = req.url.clone();
+                        }
                         "page" if detail.contains("/login") => {
                             status.set(&format!("Logging in as {email}…"));
                             if headless && check_deadline.is_none() {
@@ -420,14 +467,27 @@ pub async fn login(
                             check_deadline = None;
                             status.set("Requesting a login code…");
                         }
+                        "api" if detail.ends_with(" 429") => {
+                            break Err(anyhow::anyhow!(
+                                "JET is rate-limiting login attempts; try again in a few minutes"
+                            ));
+                        }
                         "api" if detail.contains("/email/validate") && !detail.ends_with(" 200") && headless => {
                             show_reason = Some("The security check needs you; opening a login window.");
                         }
                         "email_error" => status.println(&format!("The login page reported: {detail}")),
                         "otp_needed" => {
-                            status.pause();
-                            eprintln!("A login code was sent to {email}.");
-                            prompt_code(tx.clone());
+                            if !prompted {
+                                prompted = true;
+                                status.pause();
+                                eprintln!("A login code was sent to {email}.");
+                                prompt_code(tx.clone());
+                            }
+                            if !headless && !show_window && !handed_off && let Some(url) = &code_page {
+                                *shared.next_url.lock().unwrap() = url.clone();
+                                handed_off = true;
+                                hide = true;
+                            }
                         }
                         "api" if detail.contains("/otp/validate") => {
                             if detail.ends_with(" 200") {
@@ -445,7 +505,13 @@ pub async fn login(
                 }
             }
         }
+        if hide {
+            close(child).await;
+            headless = true;
+            child = launch(browser, paths, &extension, &start_url, true)?;
+        }
         if let Some(reason) = show_reason {
+            needed_window = true;
             status.println(reason);
             close(child).await;
             headless = false;
@@ -471,5 +537,8 @@ pub async fn login(
     if tokens.access_token.is_empty() {
         bail!("login returned an empty token");
     }
-    Ok(tokens)
+    Ok(LoginOutcome {
+        tokens,
+        needed_window,
+    })
 }

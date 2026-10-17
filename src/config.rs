@@ -55,6 +55,9 @@ pub struct Config {
     /// Chromium-based browser used for `jet login`; auto-detected when unset.
     pub browser: Option<String>,
     pub location: Option<Location>,
+    /// Until when (unix time) `jet login` starts with a visible window, because the security check
+    /// didn't pass in a hidden browser last time.
+    pub login_window_until: Option<i64>,
 }
 
 impl Default for Config {
@@ -64,6 +67,7 @@ impl Default for Config {
             email: None,
             browser: None,
             location: None,
+            login_window_until: None,
         }
     }
 }

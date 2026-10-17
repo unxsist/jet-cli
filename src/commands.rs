@@ -132,16 +132,24 @@ async fn login(
             .email
             .as_deref()
             .is_some_and(|prev| !prev.eq_ignore_ascii_case(&email));
-        let tokens = browser::login(
+        let now = chrono::Utc::now().timestamp();
+        let outcome = browser::login(
             &ctx.api.http,
             &ctx.paths,
             &tenant,
             browser.as_deref().unwrap(),
             &email,
-            fresh || switching,
-            show_browser,
+            browser::LoginOptions {
+                force_login: fresh || switching,
+                show_window: show_browser,
+                start_visible: ctx.config.login_window_until.is_some_and(|t| t > now),
+            },
         )
         .await?;
+        if outcome.needed_window {
+            ctx.config.login_window_until = Some(now + 7 * 24 * 3600);
+        }
+        let tokens = outcome.tokens;
         ctx.config.email = Some(email);
         tokens
     };
